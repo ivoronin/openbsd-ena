@@ -1,0 +1,65 @@
+--- a/sys/dev/ic/nvme.c
++++ b/sys/dev/ic/nvme.c
+@@ -304,6 +304,7 @@
+ 	u_int64_t cap;
+ 	u_int32_t reg;
+ 	u_int nccbs = 0;
++	u_int qentries = 128;
+ 
+ 	mtx_init(&sc->sc_ccb_mtx, IPL_BIO);
+ 	rw_init(&sc->sc_lock, "nvme_lock");
+@@ -344,7 +345,22 @@
+ 		return (1);
+ 	}
+ 
+-	sc->sc_admin_q = nvme_q_alloc(sc, NVME_ADMIN_Q, 128, sc->sc_dstrd);
++	/*
++	 * Clamp the requested queue size to what the controller supports.
++	 * CAP.MQES is the maximum number of queue entries the controller
++	 * accepts; some controllers (e.g. the AWS Nitro EBS NVMe on Graviton)
++	 * advertise a maximum below the 128 entries we would otherwise request
++	 * and reject ADD_IOCQ with "Invalid Queue Size" (SCT 1, SC 0x02) when
++	 * exceeded.  Also cap concurrent commands at one below the queue depth:
++	 * nvme_q_submit does not test for a full submission queue, so allowing
++	 * more outstanding commands than the ring holds would overrun it.
++	 */
++	if (qentries > NVME_CAP_MQES(cap))
++		qentries = (u_int)NVME_CAP_MQES(cap);
++	if (sc->sc_openings > qentries - 1)
++		sc->sc_openings = qentries - 1;
++
++	sc->sc_admin_q = nvme_q_alloc(sc, NVME_ADMIN_Q, qentries, sc->sc_dstrd);
+ 	if (sc->sc_admin_q == NULL) {
+ 		printf("%s: unable to allocate admin queue\n", DEVNAME(sc));
+ 		return (1);
+@@ -374,7 +390,7 @@
+ 	}
+ 	nccbs = 64;
+ 
+-	sc->sc_q = nvme_q_alloc(sc, NVME_IO_Q, 128, sc->sc_dstrd);
++	sc->sc_q = nvme_q_alloc(sc, NVME_IO_Q, qentries, sc->sc_dstrd);
+ 	if (sc->sc_q == NULL) {
+ 		printf("%s: unable to allocate io q\n", DEVNAME(sc));
+ 		goto disable;
+@@ -457,6 +473,12 @@
+ int
+ nvme_resume(struct nvme_softc *sc)
+ {
++	u_int64_t cap = nvme_read8(sc, NVME_CAP);
++	u_int qentries = 128;
++
++	if (qentries > NVME_CAP_MQES(cap))
++		qentries = (u_int)NVME_CAP_MQES(cap);
++
+ 	if (nvme_disable(sc) != 0) {
+ 		printf("%s: unable to disable controller\n", DEVNAME(sc));
+ 		return (1);
+@@ -472,7 +494,7 @@
+ 		return (1);
+ 	}
+ 
+-	sc->sc_q = nvme_q_alloc(sc, NVME_IO_Q, 128, sc->sc_dstrd);
++	sc->sc_q = nvme_q_alloc(sc, NVME_IO_Q, qentries, sc->sc_dstrd);
+ 	if (sc->sc_q == NULL) {
+ 		printf("%s: unable to allocate io q\n", DEVNAME(sc));
+ 		goto disable;

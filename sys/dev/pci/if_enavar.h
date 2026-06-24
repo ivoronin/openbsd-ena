@@ -19,6 +19,8 @@
 #define _DEV_PCI_IF_ENAVAR_H_
 
 #include <sys/timeout.h>		/* struct timeout (RX refill) */
+#include <sys/task.h>			/* struct task (reset/recovery task) */
+#include <sys/mutex.h>			/* struct mutex (AENQ drain serialization) */
 #include <net/if.h>			/* struct if_rxring */
 
 /*
@@ -235,6 +237,8 @@ struct ena_rxq {
 struct ena_tx_slot {
 	bus_dmamap_t		 txs_map;	/* per-packet DMA map */
 	struct mbuf		*txs_m;		/* packet mbuf, NULL if free */
+	uint16_t		 txs_ndesc;	/* SQ descriptors this packet used
+					 * (host placement; for txq_sq_avail) */
 };
 
 /*
@@ -281,6 +285,8 @@ struct ena_txq {
 	uint8_t			 txq_cq_phase;	/* CQ consumer phase bit */
 	uint16_t		 txq_prod;	/* host slot producer */
 	uint16_t		 txq_cons;	/* host slot consumer */
+	uint16_t		 txq_sq_avail;	/* free SQ descriptor slots
+					 * (host placement; LLQ unused) */
 };
 
 struct ena_softc {
@@ -326,6 +332,16 @@ struct ena_softc {
 	uint16_t		 sc_llq_entry_size;	/* bytes per LLQ entry */
 	uint16_t		 sc_llq_descs_before_hdr; /* descs before header */
 	uint16_t		 sc_tx_max_header;	/* max inline header bytes */
+
+	/*
+	 * Cached stateless-offload capabilities, filled by ena_get_dev_attr
+	 * from GET_FEATURE(STATELESS_OFFLOAD_CONFIG). All implicitly 0 (no
+	 * offload) when the softc is zeroed or the device lacks the feature.
+	 */
+	uint8_t			 sc_tx_csum_l3;	/* dev supports TX IPv4 header csum */
+	uint8_t			 sc_tx_csum_l4;	/* dev supports TX L4 IPv4 csum (PART) */
+	uint8_t			 sc_rx_csum_l3;	/* dev supports RX IPv4 header csum */
+	uint8_t			 sc_rx_csum_l4;	/* dev supports RX L4 IPv4 csum */
 
 	/* DMA tag for admin/IO queue allocations (Tasks 5-8) */
 	bus_dma_tag_t		 sc_dmat;
@@ -385,6 +401,28 @@ struct ena_softc {
 	int			 sc_link_up;	/* last AENQ link state */
 
 	/*
+	 * Keep-alive watchdog (Increment 1: detection only). The softc is
+	 * zeroed at attach, so 0-init of these is safe. sc_wd_tick is a 1 Hz
+	 * softclock callout armed in ena_init and cancelled in ena_stop;
+	 * ena_tick reads DEV_STS and the keep-alive timestamp, sets
+	 * ENA_FLAG_TRIGGER_RESET on a fault, and re-arms. sc_keepalive_last is
+	 * written in the mgmt-MSI-X ISR (single aligned volatile store, no lock)
+	 * and read in the tick. sc_keepalive_timeo gates the keep-alive check
+	 * (0 = disabled, set only when KEEP_ALIVE was actually subscribed).
+	 * sc_aenq_groups is the AENQ group mask the device actually negotiated.
+	 */
+	struct timeout		 sc_wd_tick;	/* 1 Hz watchdog callout */
+	struct mutex		 sc_aenq_mtx;	/* serialize AENQ drain: mgmt ISR vs tick */
+	struct task		 sc_reset_task;	/* process-ctx device reset/recovery */
+	volatile uint32_t	 sc_keepalive_last; /* getuptime() of last KEEP_ALIVE */
+	uint32_t		 sc_keepalive_timeo; /* keep-alive staleness threshold secs; 0 disables */
+	volatile unsigned int	 sc_flags;	/* ENA_FLAG_* (TRIGGER_RESET etc.) */
+	int			 sc_wd_active;	/* watchdog tick master-enable */
+	unsigned int		 sc_wd_fatal_count; /* consecutive bad DEV_STS reads (debounce) */
+	uint32_t		 sc_wd_cooldown;   /* getuptime() until which the watchdog is suppressed (post-reset) */
+	uint32_t		 sc_aenq_groups; /* AENQ groups negotiated (subscribed) */
+
+	/*
 	 * IO RX queue (Task 6). Phase 1 runs a single RX queue. Created in
 	 * ena_init (CREATE_CQ then CREATE_SQ), torn down in ena_stop
 	 * (DESTROY_SQ then DESTROY_CQ). sc_rx_created gates the teardown so a
@@ -432,6 +470,26 @@ void	ena_dmamem_free(struct ena_softc *, struct ena_dma *);
 		    sizeof(uint32_t), BUS_SPACE_BARRIER_WRITE);		\
 	} while (0)
 
+/*
+ * Pre-store barrier write: the barrier is issued BEFORE the store, mirroring
+ * ena-com's ENA_REG_WRITE32 (ena_plat.h:403-407 = wmb() then write). Unlike
+ * ENA_REG_WR32_DB (post-store), this orders all prior accesses -- in particular
+ * the cacheable CQ-descriptor consume and its bus_dmamap_sync(POSTREAD) -- ahead
+ * of this device-register store. Use it for a register write whose correctness
+ * depends on preceding (cacheable) work being globally visible first and that
+ * has no trailing device read to anchor ordering: the IO-CQ interrupt unmask
+ * re-arm. NB: on arm64 bus_space_barrier(BARRIER_WRITE) is a dmb -- it ORDERS
+ * accesses, it does not itself flush a posted MMIO write (only a read-back
+ * does); ordering the unmask after the consume is exactly what ena-com's wmb()
+ * provides here.
+ */
+#define ENA_REG_WR32_PREDB(sc, o, v)					\
+	do {								\
+		bus_space_barrier((sc)->sc_memt, (sc)->sc_memh, (o),	\
+		    sizeof(uint32_t), BUS_SPACE_BARRIER_WRITE);		\
+		bus_space_write_4((sc)->sc_memt, (sc)->sc_memh, (o), (v)); \
+	} while (0)
+
 int	ena_reset(struct ena_softc *);
 int	ena_admin_init(struct ena_softc *);
 int	ena_admin_poll(struct ena_softc *, struct ena_admin_aq_entry *,
@@ -451,6 +509,15 @@ void	ena_media_status(struct ifnet *, struct ifmediareq *);
 int	ena_init(struct ena_softc *);
 void	ena_stop(struct ena_softc *);
 
+/* Keep-alive watchdog (Increment 1: detection only) */
+void	ena_tick(void *);
+void	ena_link_state(struct ena_softc *);
+
+/* Device reset / recovery (Increment 2) */
+void	ena_reset_task(void *);
+void	ena_destroy_device(struct ena_softc *, int *);
+int	ena_restore_device(struct ena_softc *, int);
+
 /* IO RX path (Task 6) */
 void	ena_cq_unmask(struct ena_softc *, bus_size_t);
 void	ena_rx_fill(struct ena_softc *);
@@ -458,6 +525,8 @@ int	ena_rxeof(struct ena_softc *);
 int	ena_rx_intr(struct ena_softc *);
 
 /* IO TX path (Task 7) */
+int	ena_tx_llq_map(struct ena_softc *, struct pci_attach_args *);
+int	ena_tx_llq_setup(struct ena_softc *);
 int	ena_tx_llq_negotiate(struct ena_softc *, struct pci_attach_args *);
 int	ena_tx_create(struct ena_softc *);
 void	ena_tx_destroy(struct ena_softc *);

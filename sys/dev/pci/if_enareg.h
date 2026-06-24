@@ -252,6 +252,13 @@ struct ena_admin_device_attr_feature_desc {
 	uint32_t	max_mtu;
 } __packed;
 
+/* ena_admin_defs.h:944 — STATELESS_OFFLOAD_CONFIG response payload. */
+struct ena_admin_feature_offload_desc {
+	uint32_t	tx;		/* TX offload support bitmap */
+	uint32_t	rx_supported;	/* RX offload support bitmap */
+	uint32_t	rx_enabled;	/* RX offload currently-enabled bitmap */
+} __packed;
+
 /* ena_admin_defs.h:1077 — GET_FEATURE command (64-byte SQ payload). */
 struct ena_admin_get_feat_cmd {
 	struct ena_admin_aq_common_desc			aq_common_descriptor;
@@ -266,6 +273,7 @@ struct ena_admin_get_feat_resp {
 	union {
 		uint32_t				raw[14];
 		struct ena_admin_device_attr_feature_desc dev_attr;
+		struct ena_admin_feature_offload_desc	offload;
 	} u;
 } __packed;
 
@@ -274,6 +282,23 @@ struct ena_admin_get_feat_resp {
  *	ena_admin_defs.h:69 — ENA_ADMIN_AENQ_CONFIG = 26.
  */
 #define ENA_ADMIN_AENQ_CONFIG				26
+
+/*
+ * Stateless offload capability feature (ena_admin_defs.h:64). GET_FEATURE on
+ * this id returns ena_admin_feature_offload_desc; the driver caches which RX/TX
+ * checksum offloads the device supports.
+ */
+#define ENA_ADMIN_STATELESS_OFFLOAD_CONFIG		11
+
+/*
+ * feature_offload_desc support bit masks (ena_admin_defs.h:1475-1492). The TX
+ * masks apply to the .tx word; the RX masks apply to the .rx_supported word.
+ */
+#define ENA_ADMIN_FEATURE_OFFLOAD_DESC_TX_L3_CSUM_IPV4_MASK	0x1	/* BIT(0) */
+#define ENA_ADMIN_FEATURE_OFFLOAD_DESC_TX_L4_IPV4_CSUM_PART_MASK	0x2	/* BIT(1) */
+#define ENA_ADMIN_FEATURE_OFFLOAD_DESC_TX_L4_IPV4_CSUM_FULL_MASK	0x4	/* BIT(2) */
+#define ENA_ADMIN_FEATURE_OFFLOAD_DESC_RX_L3_CSUM_IPV4_MASK	0x1	/* BIT(0) */
+#define ENA_ADMIN_FEATURE_OFFLOAD_DESC_RX_L4_IPV4_CSUM_MASK	0x2	/* BIT(1) */
 
 /*
  * Host attributes (ena_admin_defs.h:71). The driver registers a 4KB host-info
@@ -357,6 +382,27 @@ struct ena_admin_aenq_common_desc {
 #define ENA_ADMIN_FATAL_ERROR		1	/* ena_admin_defs.h:1356 */
 #define ENA_ADMIN_WARNING		2	/* ena_admin_defs.h:1357 */
 #define ENA_ADMIN_KEEP_ALIVE		4	/* ena_admin_defs.h:1359 */
+
+/*
+ * Keep-alive watchdog (Increment 1: detection only). The device emits a
+ * KEEP_ALIVE AENQ event roughly once per second; if none arrives for
+ * ENA_KEEPALIVE_TIMEOUT_S the device is presumed dead. The watchdog also
+ * samples DEV_STS for FATAL_ERROR / loss of READY. Values mirror FreeBSD
+ * ena.h: DEFAULT_KEEP_ALIVE_TO (ena.h, 6s) and the 1 Hz wd callout
+ * (ena_timer_service / DEFAULT_DEVICE_RESET_TO context).
+ */
+#define ENA_WATCHDOG_HZ			1	/* watchdog tick period, seconds */
+#define ENA_KEEPALIVE_TIMEOUT_S		6	/* dead if no KEEP_ALIVE for this long (device beats ~1Hz) */
+#define ENA_WD_FATAL_THRESH		3	/* consecutive bad DEV_STS reads before reset (debounce) */
+#define ENA_WD_COOLDOWN_S		60	/* XXX iter1 DIAG: long cooldown to isolate a single reset */
+#define ENA_FLAG_TRIGGER_RESET		0x01	/* reset requested (used fully in increment 2) */
+#define ENA_FLAG_RESETTING		0x02	/* reset task mid-rebuild; guards re-entry */
+#define ENA_FLAG_DYING			0x04	/* detach in progress; suppress reset */
+/*
+ * DEV_STS FATAL_ERROR (0x20) and READY (0x1) masks are defined above as
+ * ENA_REGS_DEV_STS_FATAL_ERROR_MASK / ENA_REGS_DEV_STS_READY_MASK; the
+ * watchdog reuses those.
+ */
 
 /* ena_admin_defs.h:1370 — 64-byte AENQ ring slot. */
 struct ena_admin_aenq_entry {
@@ -540,6 +586,26 @@ struct ena_eth_io_rx_cdesc_base {
 #define ENA_ETH_IO_RX_CDESC_BASE_BUFFER_MASK	0x40000000U /* BIT(30) */
 
 /*
+ * rx_cdesc_base status csum/proto fields (ena_eth_io_defs.h:364-378). Used for
+ * RX checksum-offload decode in ena_rxeof. L3/L4 proto index identify the parsed
+ * packet type; the *_CSUM_ERR bits flag a bad checksum; CSUM_CHECKED marks that
+ * the device actually validated the L4 checksum; IPV4_FRAG marks a fragment
+ * (L4 csum not meaningful).
+ */
+#define ENA_ETH_IO_RX_CDESC_BASE_L3_PROTO_IDX_MASK	0x0000001fU
+#define ENA_ETH_IO_RX_CDESC_BASE_L4_PROTO_IDX_SHIFT	8
+#define ENA_ETH_IO_RX_CDESC_BASE_L4_PROTO_IDX_MASK	0x00001f00U
+#define ENA_ETH_IO_RX_CDESC_BASE_L3_CSUM_ERR_MASK	0x00002000U /* BIT(13) */
+#define ENA_ETH_IO_RX_CDESC_BASE_L4_CSUM_ERR_MASK	0x00004000U /* BIT(14) */
+#define ENA_ETH_IO_RX_CDESC_BASE_IPV4_FRAG_MASK		0x00008000U /* BIT(15) */
+#define ENA_ETH_IO_RX_CDESC_BASE_L4_CSUM_CHECKED_MASK	0x00010000U /* BIT(16) */
+
+/* L3/L4 proto index enum values (ena_eth_io_defs.h:11,19,20). */
+#define ENA_ETH_IO_L3_PROTO_IPV4	8
+#define ENA_ETH_IO_L4_PROTO_TCP		12
+#define ENA_ETH_IO_L4_PROTO_UDP		13
+
+/*
  * IO completion-queue interrupt register (intr_reg). The device masks an IO
  * CQ's MSI-X interrupt after it fires; the host re-arms it by writing this
  * register (with INTR_UNMASK set) to the per-CQ unmask BAR offset returned in
@@ -709,6 +775,47 @@ struct ena_eth_io_tx_cdesc {
 #define ENA_ETH_IO_TX_DESC_ADDR_HI_MASK		0x0000ffffU /* GENMASK(15,0) */
 #define ENA_ETH_IO_TX_DESC_HEADER_LENGTH_SHIFT	24
 #define ENA_ETH_IO_TX_DESC_HEADER_LENGTH_MASK	0xff000000U /* GENMASK(31,24) */
+
+/*
+ * ena_eth_io_defs.h:301-315 — tx_desc meta_ctrl checksum-offload field bits.
+ * These ride in the FIRST data descriptor's meta_ctrl word (the same word that
+ * already carries REQ_ID_LO). L3/L4 proto idx select the protocol the device
+ * checksums; L3/L4_CSUM_EN enable the offload; L4_CSUM_PARTIAL=1 selects PART
+ * mode (device ADDS the payload sum to the pre-seeded pseudo-header field that
+ * the OpenBSD stack already wrote, rather than computing a FULL csum).
+ */
+#define ENA_ETH_IO_TX_DESC_L3_PROTO_IDX_MASK	0x0000000fU /* GENMASK(3,0) */
+#define ENA_ETH_IO_TX_DESC_L4_PROTO_IDX_SHIFT	8
+#define ENA_ETH_IO_TX_DESC_L4_PROTO_IDX_MASK	0x00001f00U /* GENMASK(12,8) */
+#define ENA_ETH_IO_TX_DESC_L3_CSUM_EN_MASK	0x00002000U /* BIT(13) */
+#define ENA_ETH_IO_TX_DESC_L4_CSUM_EN_MASK	0x00004000U /* BIT(14) */
+#define ENA_ETH_IO_TX_DESC_L4_CSUM_PARTIAL_MASK	0x00020000U /* BIT(17) */
+
+/*
+ * ena_eth_io_defs.h:300-345 — tx_meta_desc (16 bytes, overlays tx_desc) field
+ * bits. The META descriptor carries the layer offsets/lengths the device needs
+ * to locate L4 for checksum/TSO. For plain csum offload mss=0 (no segmentation)
+ * so MSS_HI/MSS_LO are left zero. Mirrors ena_com_create_meta (ena_eth_com.c).
+ */
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_EXT_VALID_MASK		0x00004000U /* BIT(14) */
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_MSS_HI_SHIFT		16
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_MSS_HI_MASK		0x000f0000U /* GENMASK(19,16) */
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_ETH_META_TYPE_MASK	0x00100000U /* BIT(20) */
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_META_STORE_MASK	0x00200000U /* BIT(21) */
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_META_DESC_MASK		0x00800000U /* BIT(23) */
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_PHASE_SHIFT		24
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_PHASE_MASK		0x01000000U /* BIT(24) */
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_FIRST_MASK		0x04000000U /* BIT(26) */
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_LAST_MASK		0x08000000U /* BIT(27) */
+#define ENA_ETH_IO_TX_META_DESC_LEN_CTRL_COMP_REQ_MASK		0x10000000U /* BIT(28) */
+
+#define ENA_ETH_IO_TX_META_DESC_WORD2_L3_HDR_LEN_MASK		0x000000ffU /* GENMASK(7,0) */
+#define ENA_ETH_IO_TX_META_DESC_WORD2_L3_HDR_OFF_SHIFT		8
+#define ENA_ETH_IO_TX_META_DESC_WORD2_L3_HDR_OFF_MASK		0x0000ff00U /* GENMASK(15,8) */
+#define ENA_ETH_IO_TX_META_DESC_WORD2_L4_HDR_LEN_IN_WORDS_SHIFT	16
+#define ENA_ETH_IO_TX_META_DESC_WORD2_L4_HDR_LEN_IN_WORDS_MASK	0x003f0000U /* GENMASK(21,16) */
+#define ENA_ETH_IO_TX_META_DESC_WORD2_MSS_LO_SHIFT		22
+#define ENA_ETH_IO_TX_META_DESC_WORD2_MSS_LO_MASK		0xffc00000U /* GENMASK(31,22) */
 
 /* ena_eth_io_defs.h:350 — tx_cdesc flags. */
 #define ENA_ETH_IO_TX_CDESC_PHASE_MASK		0x1	/* BIT(0) */

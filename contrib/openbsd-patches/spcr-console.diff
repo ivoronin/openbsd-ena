@@ -1,0 +1,168 @@
+--- a/sys/dev/acpi/acpivar.h
++++ b/sys/dev/acpi/acpivar.h
+@@ -66,6 +66,8 @@
+ #define acpidevcf_addr		cf_loc[ACPIDEVCF_ADDR]
+ #define ACPIDEVCF_ADDR_UNK	-1
+ 
++struct acpi_spcr;
++
+ struct acpi_attach_args {
+ 	char		*aaa_name;
+ 	bus_space_tag_t	 aaa_iot;
+@@ -82,6 +84,7 @@
+ 	uint32_t	 aaa_irq[8];
+ 	uint32_t	 aaa_irq_flags[8];
+ 	int		 aaa_nirq;
++	struct acpi_spcr *aaa_spcr;	/* non-NULL: SPCR-only console attach */
+ };
+ 
+ struct acpi_mem_map {
+--- a/sys/dev/acpi/acpi.c
++++ b/sys/dev/acpi/acpi.c
+@@ -104,6 +104,7 @@
+ int	acpi_foundsony(struct aml_node *node, void *arg);
+ int	acpi_foundhid(struct aml_node *, void *);
+ int	acpi_add_device(struct aml_node *node, void *arg);
++void	acpi_foundspcr(struct acpi_softc *);
+ 
+ void	acpi_thread(void *);
+ void	acpi_create_thread(void *);
+@@ -1325,6 +1326,13 @@
+ 	/* attach battery, power supply and button devices */
+ 	aml_find_node(sc->sc_root, "_HID", acpi_foundhid, sc);
+ 
++	/*
++	 * Attach a console UART described only by the SPCR table (no _HID
++	 * device in the namespace), as used by AWS Graviton and other SBBR
++	 * ARM platforms.
++	 */
++	acpi_foundspcr(sc);
++
+ 	aml_walknodes(sc->sc_root, AML_WALK_PRE, acpi_add_device, sc);
+ 
+ #ifndef SMALL_KERNEL
+@@ -3349,6 +3357,53 @@
+ 	return (0);
+ }
+ 
++/*
++ * Attach the console UART described by the ACPI SPCR table when it has no
++ * _HID device in the namespace (the AWS Graviton / ARM SBBR case).  The
++ * early console already runs on it (the bootloader synthesizes an FDT serial
++ * node from SPCR), but without a config(8)-matched driver there is no tty
++ * backing /dev/console.  Synthesize an attach so com(4)/pluart(4) can claim
++ * it from SPCR; the driver's own console check dedups against an _HID device
++ * that may already own the same base address.
++ */
++void
++acpi_foundspcr(struct acpi_softc *sc)
++{
++	struct device		*self = (struct device *)sc;
++	struct acpi_q		*entry;
++	struct acpi_spcr	*spcr = NULL;
++	struct acpi_attach_args	 aaa;
++
++	SIMPLEQ_FOREACH(entry, &sc->sc_tables, q_next) {
++		if (memcmp(((struct acpi_table_header *)entry->q_table)->
++		    signature, SPCR_SIG, 4) == 0) {
++			spcr = entry->q_table;
++			break;
++		}
++	}
++	if (spcr == NULL)
++		return;
++	if (spcr->base_address.address_space_id != GAS_SYSTEM_MEMORY ||
++	    spcr->base_address.address == 0)
++		return;
++
++	memset(&aaa, 0, sizeof(aaa));
++	aaa.aaa_iot = sc->sc_iot;
++	aaa.aaa_memt = sc->sc_memt;
++	aaa.aaa_node = sc->sc_root;
++	aaa.aaa_dev = "";
++	aaa.aaa_cdev = "";
++	aaa.aaa_naddr = 1;
++	aaa.aaa_addr[0] = spcr->base_address.address;
++	aaa.aaa_size[0] = 0x1000;
++	aaa.aaa_bst[0] = sc->sc_memt;
++	aaa.aaa_nirq = 1;
++	aaa.aaa_irq[0] = spcr->gsiv;
++	aaa.aaa_irq_flags[0] = 0;	/* GIC SPI, level-triggered, active-high */
++	aaa.aaa_spcr = spcr;
++	config_found(self, &aaa, acpi_print);
++}
++
+ #ifndef SMALL_KERNEL
+ int
+ acpi_founddock(struct aml_node *node, void *arg)
+--- a/sys/dev/acpi/com_acpi.c
++++ b/sys/dev/acpi/com_acpi.c
+@@ -70,6 +70,21 @@
+ 
+ 	if (aaa->aaa_naddr < 1 || aaa->aaa_nirq < 1)
+ 		return 0;
++
++	if (aaa->aaa_spcr != NULL) {
++		/*
++		 * SPCR-only console UART (no _HID); see acpi_foundspcr().
++		 * com_fdt_init_cons() drives the early console via cn_tab
++		 * without setting comconsaddr, so match on the SPCR interface
++		 * type and let com_acpi_is_console() confirm console-ness in
++		 * attach.
++		 */
++		if (aaa->aaa_spcr->interface_type == SPCR_16550 ||
++		    aaa->aaa_spcr->interface_type == SPCR_16450)
++			return 1;
++		return 0;
++	}
++
+ 	if (cf->acpidevcf_addr != aaa->aaa_addr[0] &&
+ 	    cf->acpidevcf_addr != ACPIDEVCF_ADDR_UNK)
+ 		return 0;
+@@ -127,6 +142,46 @@
+ 			comconsfreq = sc->sc.sc_frequency;
+ 			comconsrate = B115200;
+ 		}
++	} else if (aaa->aaa_spcr != NULL) {
++		struct acpi_spcr *spcr = aaa->aaa_spcr;
++
++		/*
++		 * SPCR-only console (no _HID).  The bootloader describes an
++		 * SPCR 16550 as a Synopsys DesignWare UART, so use the same
++		 * busy-detect-clearing interrupt handler.  Derive the register
++		 * stride from the SPCR GAS, matching the early-console FDT
++		 * serial node, and inherit its clock so the divisor computed at
++		 * open time is correct.
++		 */
++		intr = com_acpi_intr_designware;
++		sc->sc.sc_uarttype = COM_UART_16550;
++		switch (spcr->base_address.access_size) {
++		case GAS_ACCESS_WORD:
++			sc->sc.sc_reg_width = 2;
++			break;
++		case GAS_ACCESS_DWORD:
++			sc->sc.sc_reg_width = 4;
++			break;
++		default:
++			sc->sc.sc_reg_width = 1;
++			break;
++		}
++		sc->sc.sc_reg_shift = 0;
++		if (spcr->base_address.register_bit_width > 8)
++			sc->sc.sc_reg_shift = 1;
++		if (spcr->base_address.register_bit_width > 16)
++			sc->sc.sc_reg_shift = 2;
++		if (spcr->base_address.register_bit_width > 32)
++			sc->sc.sc_reg_shift = 3;
++		if (comconsfreq != 0)
++			sc->sc.sc_frequency = comconsfreq;
++
++		if (com_acpi_is_console(sc)) {
++			SET(sc->sc.sc_hwflags, COM_HW_CONSOLE);
++			SET(sc->sc.sc_swflags, COM_SW_SOFTCAR);
++			comconsfreq = sc->sc.sc_frequency;
++			comconsrate = B115200;
++		}
+ 	}
+ 
+ 	if (sc->sc.sc_iobase == comconsaddr) {

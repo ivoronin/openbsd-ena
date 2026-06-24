@@ -21,6 +21,7 @@
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/timeout.h>
+#include <sys/task.h>
 
 #include <machine/bus.h>
 
@@ -33,6 +34,7 @@
 
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
+#include <netinet/ip.h>
 
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
@@ -71,6 +73,11 @@ void	ena_media_status(struct ifnet *, struct ifmediareq *);
 int	ena_init(struct ena_softc *);
 void	ena_stop(struct ena_softc *);
 
+/* Device reset / recovery (Increment 2) */
+void	ena_reset_task(void *);
+void	ena_destroy_device(struct ena_softc *, int *);
+int	ena_restore_device(struct ena_softc *, int);
+
 /* IO RX path (Task 6) */
 void	ena_cq_unmask(struct ena_softc *, bus_size_t);
 int	ena_rx_create(struct ena_softc *);
@@ -81,6 +88,8 @@ int	ena_rx_intr(struct ena_softc *);
 void	ena_rx_refill(void *);
 
 /* IO TX path (Task 7) */
+int	ena_tx_llq_map(struct ena_softc *, struct pci_attach_args *);
+int	ena_tx_llq_setup(struct ena_softc *);
 int	ena_tx_llq_negotiate(struct ena_softc *, struct pci_attach_args *);
 int	ena_tx_create(struct ena_softc *);
 void	ena_tx_destroy(struct ena_softc *);
@@ -478,10 +487,29 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	 * Runs after admin init + GET_FEATURE so the admin queue is usable for
 	 * the SET_FEATURE(AENQ_CONFIG) command.
 	 */
+	mtx_init(&sc->sc_aenq_mtx, IPL_NET);	/* before AENQ unmask: the ISR can fire after */
 	if (ena_aenq_init(sc) != 0) {
 		printf("\n%s: AENQ init failed\n", sc->sc_dev.dv_xname);
 		goto disestablish_io;
 	}
+
+	/*
+	 * Keep-alive watchdog (Increment 1: detection only). The device is now
+	 * known-good and sc_aenq_groups reflects the AENQ groups actually
+	 * subscribed, so set up the 1 Hz callout. We do NOT timeout_add here:
+	 * arming is deferred to ena_init so the tick never runs while the
+	 * interface is down (mirrors vio/mcx). Gate the keep-alive staleness
+	 * check on whether KEEP_ALIVE was truly subscribed -- otherwise a device
+	 * that never beats would be (wrongly) declared dead. sc_keepalive_last is
+	 * seeded now so the first tick after up is not instantly stale.
+	 */
+	timeout_set(&sc->sc_wd_tick, ena_tick, sc);
+	task_set(&sc->sc_reset_task, ena_reset_task, sc);
+	sc->sc_keepalive_last = getuptime();
+	sc->sc_keepalive_timeo =
+	    (sc->sc_aenq_groups & (1U << ENA_ADMIN_KEEP_ALIVE)) ?
+	    ENA_KEEPALIVE_TIMEOUT_S : 0;
+	sc->sc_wd_active = 1;	/* XXX TEST: detection-only (auto-reset gated off below) */
 
 	/*
 	 * Wire up the ethernet interface (Task 5).
@@ -505,7 +533,29 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 		ifp->if_ioctl = ena_ioctl;
 		ifp->if_xflags = IFXF_MPSAFE;
 		ifp->if_qstart = ena_start;
-		ifp->if_capabilities = 0;	/* expanded in Tasks 6/7 */
+		/*
+		 * Advertise only the TX checksum offloads the device's OFFLOAD
+		 * feature actually reported (sc_tx_csum_l3/l4, read at attach in
+		 * ena_get_dev_attr). Advertising IFCAP_CSUM_* is what makes the
+		 * IP stack hand ena_encap packets with M_*_CSUM_OUT set and the
+		 * L4 field pre-seeded with the pseudo-header sum (so the device's
+		 * PART-mode offload completes them). RX csum is handled in
+		 * ena_rxeof; this only gates the TX-side capability bits.
+		 */
+		ifp->if_capabilities = 0;
+		/*
+		 * TX csum is emitted only on the LLQ push path (ena_encap), so
+		 * advertise it only when LLQ was negotiated — otherwise the stack
+		 * would delegate a checksum this driver would not complete. RX
+		 * csum (ena_rxeof) needs no capability bit and works regardless.
+		 */
+		if (sc->sc_tx_llq) {
+			if (sc->sc_tx_csum_l3)
+				ifp->if_capabilities |= IFCAP_CSUM_IPv4;
+			if (sc->sc_tx_csum_l4)
+				ifp->if_capabilities |= IFCAP_CSUM_TCPv4 |
+				    IFCAP_CSUM_UDPv4;
+		}
 
 		ifmedia_init(&sc->sc_media, IFM_IMASK, ena_media_change,
 		    ena_media_status);
@@ -1011,6 +1061,45 @@ ena_get_dev_attr(struct ena_softc *sc)
 	    sc->sc_dev.dv_xname, ena_ver_maj, ena_ver_min, ctrl_ver_val,
 	    max_mtu, ether_sprintf(mac));
 
+	/*
+	 * --- STATELESS_OFFLOAD_CONFIG via GET_FEATURE, response INLINE. ---
+	 *
+	 * Second GET_FEATURE, same inline pattern as DEVICE_ATTRIBUTES above
+	 * (control_buffer.length == 0). Cache which RX/TX checksum offloads the
+	 * device advertises. This feature is OPTIONAL: a device that does not
+	 * implement feature 11 returns an error, which we swallow (leaving all
+	 * four flags 0) so attach does not abort. The DEVICE_ATTRIBUTES result
+	 * read above is already stashed, so reusing cmd/resp here is safe.
+	 */
+	memset(&cmd, 0, sizeof(cmd));
+	gf->aq_common_descriptor.opcode = ENA_ADMIN_GET_FEATURE;
+	gf->aq_common_descriptor.flags = 0;
+	gf->control_buffer.length = 0;		/* inline response, like dev_attr */
+	gf->feat_common.feature_id = ENA_ADMIN_STATELESS_OFFLOAD_CONFIG;
+	gf->feat_common.feature_version = 0;
+
+	error = ena_admin_poll(sc, &cmd, &resp);
+	if (error == 0) {
+		uint32_t tx = letoh32(gr->u.offload.tx);
+		uint32_t rxs = letoh32(gr->u.offload.rx_supported);
+
+		sc->sc_tx_csum_l3 =
+		    !!(tx & ENA_ADMIN_FEATURE_OFFLOAD_DESC_TX_L3_CSUM_IPV4_MASK);
+		sc->sc_tx_csum_l4 =
+		    !!(tx & ENA_ADMIN_FEATURE_OFFLOAD_DESC_TX_L4_IPV4_CSUM_PART_MASK);
+		sc->sc_rx_csum_l3 =
+		    !!(rxs & ENA_ADMIN_FEATURE_OFFLOAD_DESC_RX_L3_CSUM_IPV4_MASK);
+		sc->sc_rx_csum_l4 =
+		    !!(rxs & ENA_ADMIN_FEATURE_OFFLOAD_DESC_RX_L4_IPV4_CSUM_MASK);
+	} else {
+		/* Device lacks feature 11: leave all four 0. Do NOT fail attach. */
+		error = 0;	/* swallow; offload is optional */
+	}
+
+	printf("%s: offload tx_l3=%u tx_l4=%u rx_l3=%u rx_l4=%u\n",
+	    sc->sc_dev.dv_xname, sc->sc_tx_csum_l3, sc->sc_tx_csum_l4,
+	    sc->sc_rx_csum_l3, sc->sc_rx_csum_l4);
+
 	return (0);
 }
 
@@ -1164,6 +1253,15 @@ ena_aenq_init(struct ena_softc *sc)
 	}
 
 	/*
+	 * Record the groups we actually negotiated/SET (already masked by the
+	 * device's supported_groups above). The keep-alive watchdog gates its
+	 * staleness check on (sc_aenq_groups & (1U << ENA_ADMIN_KEEP_ALIVE)) so
+	 * it never declares a device dead that simply never subscribed to the
+	 * KEEP_ALIVE heartbeat.
+	 */
+	sc->sc_aenq_groups = groups;
+
+	/*
 	 * Unmask the management interrupt BEFORE ringing the AENQ head doorbell.
 	 * Order matters: ena_com unmasks the admin/AENQ interrupt
 	 * (ena_com_set_admin_polling_mode(false) -> INTR_MASK = 0, ena_com.c:1756)
@@ -1227,6 +1325,8 @@ ena_aenq_intr(struct ena_softc *sc)
 	uint16_t group;
 	int link_changed = 0;
 
+	mtx_enter(&sc->sc_aenq_mtx);
+
 	ring = (struct ena_admin_aenq_entry *)ENA_DMA_KVA(&sc->sc_aenq_dma);
 	qmask = sc->sc_aenq_depth - 1;
 	masked_head = sc->sc_aenq_head & qmask;
@@ -1259,23 +1359,39 @@ ena_aenq_intr(struct ena_softc *sc)
 			    ENA_ADMIN_AENQ_LINK_CHANGE_DESC_LINK_STATUS_MASK)
 			    ? 1 : 0;
 			/*
-			 * Propagate the new link state to the ifnet layer so
-			 * that ifconfig(8) reports the link status correctly
-			 * and routing code can react. Mirrors vio_link_state
+			 * sc_link_up is now cached; the actual ifnet push is
+			 * deferred to after the drain loop and funnelled through
+			 * ena_link_state(sc) (which sets if_link_state and calls
+			 * if_link_state_change). Mirrors vio_link_state
 			 * (if_vio.c:963-978).
 			 */
-			sc->sc_ac.ac_if.if_link_state = sc->sc_link_up ?
-			    LINK_STATE_FULL_DUPLEX : LINK_STATE_DOWN;
-			/* Notify ifnet after the drain loop (below). */
 			link_changed = 1;
 			printf("%s: link %s\n", sc->sc_dev.dv_xname,
 			    sc->sc_link_up ? "UP" : "DOWN");
 			break;
 		case ENA_ADMIN_KEEP_ALIVE:
-			/* keep-alive heartbeat; consumed (drained) below. */
+			/*
+			 * Device heartbeat. Stamp the monotonic uptime so the
+			 * watchdog tick (ena_tick) can detect staleness. This
+			 * runs in the mgmt MSI-X ISR; getuptime() is sleep-free
+			 * and the single aligned volatile write needs no lock.
+			 */
+			sc->sc_keepalive_last = getuptime();
+			break;
+		case ENA_ADMIN_FATAL_ERROR:
+			/*
+			 * Device-reported fatal error. Flag a reset; do NOT
+			 * task_add here -- the 1 Hz tick (ena_tick) is the
+			 * single enqueue point, so it picks this up on its next
+			 * pass (this runs in the mgmt MSI-X ISR, which must stay
+			 * sleep/reset-free).
+			 */
+			printf("%s: AENQ FATAL_ERROR event\n",
+			    sc->sc_dev.dv_xname);
+			SET(sc->sc_flags, ENA_FLAG_TRIGGER_RESET);
 			break;
 		default:
-			/* FATAL_ERROR / WARNING / others: log and continue. */
+			/* WARNING / others: log and continue. */
 			printf("%s: AENQ event group %u\n",
 			    sc->sc_dev.dv_xname, group);
 			break;
@@ -1292,8 +1408,10 @@ ena_aenq_intr(struct ena_softc *sc)
 	}
 
 	/* Nothing consumed: leave head/phase and the doorbell untouched. */
-	if (processed == 0)
+	if (processed == 0) {
+		mtx_leave(&sc->sc_aenq_mtx);
 		return;
+	}
 
 	sc->sc_aenq_head += processed;
 	sc->sc_aenq_phase = phase;
@@ -1309,12 +1427,16 @@ ena_aenq_intr(struct ena_softc *sc)
 	/* Ring the AENQ head doorbell with the new monotonic head. */
 	ENA_REG_WR32_DB(sc, ENA_REGS_AENQ_HEAD_DB_OFF, sc->sc_aenq_head);
 
+	mtx_leave(&sc->sc_aenq_mtx);
+
 	/*
-	 * Notify the ifnet layer of a link-state change after the drain loop:
-	 * if_link_state_change defers the heavy work via task_add.
+	 * Notify the ifnet layer of a link-state change after the drain loop (and
+	 * outside the mutex), funnelled through ena_link_state (which only fires
+	 * if_link_state_change -- itself task_add-deferred -- when the state
+	 * actually changed).
 	 */
 	if (link_changed)
-		if_link_state_change(&sc->sc_ac.ac_if);
+		ena_link_state(sc);
 }
 
 /*
@@ -1369,6 +1491,22 @@ ena_detach(struct device *self, int flags)
 	/* Nothing mapped: attach failed before the BAR was mapped. */
 	if (sc->sc_mems == 0)
 		return (0);
+
+	/*
+	 * CORRECTION 2: drain the watchdog tick and the reset task BEFORE any
+	 * other teardown, and WITHOUT holding NET_LOCK. ena_reset_task takes
+	 * NET_LOCK, so holding it across taskq_barrier here would self-deadlock;
+	 * config_detach does not hold NET_LOCK and this routine does not take it
+	 * (verified: ena_detach calls ena_stop/ena_reset bare, never NET_LOCK),
+	 * so the barrier is safe. Setting DYING first makes ena_tick stop
+	 * enqueueing and makes any already-running reset task abort early. This
+	 * MUST complete before ena_stop/ena_reset/DMA-free below, or a concurrent
+	 * reset task would touch freed state.
+	 */
+	SET(sc->sc_flags, ENA_FLAG_DYING);
+	timeout_del_barrier(&sc->sc_wd_tick);	/* cancel + wait for a running tick */
+	task_del(systq, &sc->sc_reset_task);	/* dequeue a pending run */
+	taskq_barrier(systq);			/* wait for a running reset task */
 
 	/*
 	 * Reverse of ena_attach. Ordering matters:
@@ -1484,8 +1622,16 @@ ena_detach(struct device *self, int flags)
  * intr_control is just the UNMASK bit. Mirrors ena_com_update_intr_reg
  * (ena_com.h:1351, unmask=true, delays 0) + ena_com_unmask_intr
  * (ena_eth_com.h:91, writes intr_control to io_cq->unmask_reg). The register is
- * little-endian like the rest of the BAR window, so ENA_REG_WR32 (no swap) is
- * correct.
+ * little-endian like the rest of the BAR window, so a plain store is correct
+ * (no byte swap).
+ *
+ * The store goes through ENA_REG_WR32_PREDB, not plain ENA_REG_WR32: ena-com's
+ * ena_com_unmask_intr writes this register via ENA_REG_WRITE32, which carries a
+ * pre-store wmb() (ena_plat.h:403-407). That barrier orders the preceding CQ
+ * consume (bus_dmamap_sync POSTREAD in ena_rxeof/ena_txeof) ahead of the unmask
+ * store; this is the sole re-arm of the shared IO MSI-X vector and the last
+ * device access in the handler, with no trailing read, so the plain (barrierless)
+ * accessor left the re-arm unordered against the consume on weakly-ordered arm64.
  */
 void
 ena_cq_unmask(struct ena_softc *sc, bus_size_t unmask_off)
@@ -1494,7 +1640,7 @@ ena_cq_unmask(struct ena_softc *sc, bus_size_t unmask_off)
 
 	/* delays 0 (no moderation) + INTR_UNMASK. */
 	intr_reg = ENA_ETH_IO_INTR_REG_INTR_UNMASK_MASK;
-	ENA_REG_WR32(sc, unmask_off, intr_reg);
+	ENA_REG_WR32_PREDB(sc, unmask_off, intr_reg);
 }
 
 /*
@@ -1955,6 +2101,39 @@ ena_rxeof(struct ena_softc *sc)
 		rxs->rxs_m = NULL;
 		m->m_pkthdr.len = m->m_len = len;
 
+		/*
+		 * RX checksum-offload decode (never-drop policy): set only the
+		 * *_IN_OK flags when the device reports a verified-good checksum.
+		 * We never set *_IN_BAD -- a device misreport simply degrades to
+		 * software re-verify in the stack, never a drop. L4 OK requires
+		 * the device to have actually CHECKED the L4 csum and the packet
+		 * not to be an IPv4 fragment.
+		 */
+		{
+			uint32_t l3p = status &
+			    ENA_ETH_IO_RX_CDESC_BASE_L3_PROTO_IDX_MASK;
+			uint32_t l4p = (status &
+			    ENA_ETH_IO_RX_CDESC_BASE_L4_PROTO_IDX_MASK) >>
+			    ENA_ETH_IO_RX_CDESC_BASE_L4_PROTO_IDX_SHIFT;
+
+			if (sc->sc_rx_csum_l3 &&
+			    l3p == ENA_ETH_IO_L3_PROTO_IPV4 &&
+			    !(status & ENA_ETH_IO_RX_CDESC_BASE_L3_CSUM_ERR_MASK))
+				m->m_pkthdr.csum_flags |= M_IPV4_CSUM_IN_OK;
+
+			if (sc->sc_rx_csum_l4 &&
+			    (status & ENA_ETH_IO_RX_CDESC_BASE_L4_CSUM_CHECKED_MASK) &&
+			    !(status & ENA_ETH_IO_RX_CDESC_BASE_IPV4_FRAG_MASK) &&
+			    !(status & ENA_ETH_IO_RX_CDESC_BASE_L4_CSUM_ERR_MASK)) {
+				if (l4p == ENA_ETH_IO_L4_PROTO_TCP)
+					m->m_pkthdr.csum_flags |=
+					    M_TCP_CSUM_IN_OK;
+				else if (l4p == ENA_ETH_IO_L4_PROTO_UDP)
+					m->m_pkthdr.csum_flags |=
+					    M_UDP_CSUM_IN_OK;
+			}
+		}
+
 		ml_enqueue(&ml, m);
 		rxfree++;
 	}
@@ -2031,8 +2210,74 @@ ena_rx_intr(struct ena_softc *sc)
  *
  * The chosen mode is printed for the milestone log.
  */
+/*
+ * ena_tx_llq_map -- ONE-TIME map of the BAR2 LLQ memory window.
+ *
+ * This is the only part of LLQ bring-up that needs the pci_attach_args, so it
+ * is split out and called exactly once from ena_attach (via the
+ * ena_tx_llq_negotiate wrapper). The device places the push descriptor list in
+ * this window; the per-SQ byte offset is reported in the CREATE_SQ response
+ * (llq_descriptors_offset) and applied in ena_tx_create. The window persists
+ * for the device's lifetime (ena_reset does NOT unmap it), so a mid-life reset
+ * recovery re-runs ena_tx_llq_setup() only and never remaps here.
+ *
+ * Mapping failure is NOT fatal: it leaves sc_llq_s == 0, and ena_tx_llq_setup
+ * then treats a missing window as host-memory placement.
+ */
 int
-ena_tx_llq_negotiate(struct ena_softc *sc, struct pci_attach_args *pa)
+ena_tx_llq_map(struct ena_softc *sc, struct pci_attach_args *pa)
+{
+	pcireg_t memtype;
+
+	/* Already mapped (or a previous map failed): nothing to do. */
+	if (sc->sc_llq_s != 0)
+		return (0);
+
+	memtype = pci_mapreg_type(sc->sc_pc, sc->sc_tag, ENA_PCI_MEM_BAR);
+	/*
+	 * BUS_SPACE_MAP_PREFETCHABLE maps the LLQ push window write-combining
+	 * (Normal-NC on arm64) like FreeBSD ena_enable_wc; it is a perf/ordering
+	 * choice, never the cause of a map failure. NOTE: on the native EC2
+	 * Graviton VF, BAR2 is unassigned (reads as 0), so this map fails and the
+	 * driver uses host-memory TX placement -- the device exposes no LLQ
+	 * window there, and host placement is the correct supported mode.
+	 */
+	if (pci_mapreg_map(pa, ENA_PCI_MEM_BAR, memtype,
+	    BUS_SPACE_MAP_PREFETCHABLE,
+	    &sc->sc_llq_t, &sc->sc_llq_h, NULL, &sc->sc_llq_s, 0) != 0) {
+		printf("%s: can't map LLQ mem BAR, using host TX mode\n",
+		    sc->sc_dev.dv_xname);
+		sc->sc_llq_s = 0;
+		return (0);
+	}
+
+	return (0);
+}
+
+/*
+ * ena_tx_llq_setup -- GET/SET LLQ admin feature commit + geometry.
+ *
+ * The re-callable half of LLQ negotiation: it runs the GET_FEATURE(LLQ) /
+ * SET_FEATURE(LLQ) admin commands and stores the chosen geometry
+ * (sc_tx_llq, sc_llq_entry_size, sc_llq_descs_before_hdr, sc_tx_max_header).
+ * It needs NO pci_attach_args, so it is safe to call again after a device
+ * reset to RE-COMMIT LLQ (a reset returns the NIC to host-memory placement, so
+ * recovery must re-issue SET_FEATURE(LLQ) or TX silently breaks).
+ *
+ * Graceful fallback is preserved: GET failure (e.g. status 3 / unsupported),
+ * max_llq_num == 0, an unsupported geometry bit, an unmapped BAR2 window, or a
+ * SET rejection all select host-memory placement (sc_tx_llq = 0) and return 0
+ * — never a hard error. Unlike the old combined routine, this does NOT own the
+ * BAR2 map: it never maps or unmaps it (ena_tx_llq_map / ena_detach own that),
+ * so a host-mode fallback simply leaves the (already mapped, unused) window in
+ * place.
+ *
+ * Mirrors ena_com_config_dev_mode (ena_com.c:3488-3515) + ena_com_set_llq
+ * (ena_com.c:609-642) collapsed to the Phase 1 case (see the original notes:
+ * INLINE_HEADER, MULTIPLE_DESCS_PER_ENTRY, descs_before_header=2, 128B entry).
+ */
+int
+ena_tx_llq_setup(struct ena_softc *sc)
 {
 	struct ena_admin_aq_entry cmd;
 	struct ena_admin_acq_entry resp;
@@ -2043,7 +2288,6 @@ ena_tx_llq_negotiate(struct ena_softc *sc, struct pci_attach_args *pa)
 	struct ena_admin_set_feat_llq_cmd *sf =
 	    (struct ena_admin_set_feat_llq_cmd *)&cmd;
 	struct ena_admin_feature_llq_desc *llq;
-	pcireg_t memtype;
 	uint32_t max_llq_num;
 	int error;
 
@@ -2052,6 +2296,13 @@ ena_tx_llq_negotiate(struct ena_softc *sc, struct pci_attach_args *pa)
 	sc->sc_llq_entry_size = ENA_LLQ_ENTRY_SIZE;
 	sc->sc_llq_descs_before_hdr = ENA_LLQ_DESCS_BEFORE_HEADER;
 	sc->sc_tx_max_header = ENA_TX_MAX_HEADER_SIZE;
+
+	/* No BAR2 window mapped: LLQ is impossible, use host placement. */
+	if (sc->sc_llq_s == 0) {
+		printf("%s: TX mode host (no LLQ window)\n",
+		    sc->sc_dev.dv_xname);
+		return (0);
+	}
 
 	/* --- GET_FEATURE(LLQ): response delivered INLINE in the ACQ. --- */
 	memset(&cmd, 0, sizeof(cmd));
@@ -2100,20 +2351,6 @@ ena_tx_llq_negotiate(struct ena_softc *sc, struct pci_attach_args *pa)
 		return (0);
 	}
 
-	/*
-	 * Map the BAR2 LLQ memory window. The device places the push descriptor
-	 * list there; the per-SQ byte offset is returned in the CREATE_SQ
-	 * response (llq_descriptors_offset) and applied in ena_tx_create.
-	 */
-	memtype = pci_mapreg_type(sc->sc_pc, sc->sc_tag, ENA_PCI_MEM_BAR);
-	if (pci_mapreg_map(pa, ENA_PCI_MEM_BAR, memtype, 0,
-	    &sc->sc_llq_t, &sc->sc_llq_h, NULL, &sc->sc_llq_s, 0) != 0) {
-		printf("%s: can't map LLQ mem BAR, using host TX mode\n",
-		    sc->sc_dev.dv_xname);
-		sc->sc_llq_s = 0;
-		return (0);
-	}
-
 	/* --- SET_FEATURE(LLQ): commit the chosen geometry. --- */
 	memset(&cmd, 0, sizeof(cmd));
 	sf->aq_common_descriptor.opcode = ENA_ADMIN_SET_FEATURE;
@@ -2131,11 +2368,13 @@ ena_tx_llq_negotiate(struct ena_softc *sc, struct pci_attach_args *pa)
 
 	error = ena_admin_poll(sc, &cmd, NULL);
 	if (error != 0) {
-		/* Device rejected our layout: drop the BAR2 map and use host. */
+		/*
+		 * Device rejected our layout: use host placement. We do NOT
+		 * unmap the BAR2 window here — ena_tx_llq_map / ena_detach own
+		 * its lifetime, and a re-commit on a later reset may succeed.
+		 */
 		printf("%s: SET_FEATURE(LLQ) failed (%d), using host TX mode\n",
 		    sc->sc_dev.dv_xname, error);
-		bus_space_unmap(sc->sc_llq_t, sc->sc_llq_h, sc->sc_llq_s);
-		sc->sc_llq_s = 0;
 		return (0);
 	}
 
@@ -2144,6 +2383,24 @@ ena_tx_llq_negotiate(struct ena_softc *sc, struct pci_attach_args *pa)
 	    sc->sc_dev.dv_xname, sc->sc_llq_entry_size,
 	    sc->sc_llq_descs_before_hdr, sc->sc_tx_max_header);
 	return (0);
+}
+
+/*
+ * ena_tx_llq_negotiate -- thin attach-time wrapper: map the BAR2 LLQ window
+ * (the one part needing pci_attach_args) then run the GET/SET LLQ admin
+ * commit. The ena_attach call site is unchanged. Recovery (ena_restore_device)
+ * calls ena_tx_llq_setup() directly, since the window is already mapped and
+ * ena_reset does not unmap it.
+ */
+int
+ena_tx_llq_negotiate(struct ena_softc *sc, struct pci_attach_args *pa)
+{
+	int error;
+
+	error = ena_tx_llq_map(sc, pa);
+	if (error != 0)
+		return (error);
+	return (ena_tx_llq_setup(sc));
 }
 
 /*
@@ -2204,6 +2461,14 @@ ena_tx_create(struct ena_softc *sc)
 	txq->txq_cq_phase = 1;	/* first CQ completion is read at phase 1 */
 	txq->txq_prod = 0;
 	txq->txq_cons = 0;
+	/*
+	 * Host-placement free SQ descriptor slots: at most depth-1 descriptors
+	 * outstanding (one slot kept free to distinguish full from empty), so a
+	 * multi-segment packet's descriptors never lap an unreclaimed slot. LLQ
+	 * placement does not use this (its tail counts entries, gated by
+	 * txq_prod/txq_cons).
+	 */
+	txq->txq_sq_avail = txq->txq_depth - 1;
 	txq->txq_llq = sc->sc_tx_llq;
 	txq->txq_llq_t = sc->sc_llq_t;
 	txq->txq_llq_h = sc->sc_llq_h;
@@ -2508,6 +2773,27 @@ ena_encap(struct ena_softc *sc, struct mbuf *m)
 	uint32_t len_ctrl, meta_ctrl, addr_lo, addr_hi_hdr;
 	uint64_t paddr;
 	int nsegs, ndesc, i, b;
+	/*
+	 * TX checksum offload (IPv4 only). do_csum is set only when ALL of the
+	 * following hold, so the non-csum path below is reached with do_csum==0
+	 * and behaves byte-for-byte as before:
+	 *   - the stack requested an offload (M_IPV4/TCP/UDP_CSUM_OUT), AND
+	 *   - the device's OFFLOAD feature reported the matching capability, AND
+	 *   - LLQ (push) placement is in use (csum is scoped to the LLQ path;
+	 *     see the host-mem note below), AND
+	 *   - the L2/L3/L4 headers parse cleanly: untagged Ethernet (no VLAN),
+	 *     IPv4 with ip_hl==5 (the only shape the stack hands us with a
+	 *     pre-seeded pseudo-header), and a readable L4 header.
+	 * When set, the entry prepends ONE meta descriptor (carrying the layer
+	 * offsets/lengths) and the first data descriptor's meta_ctrl word gets
+	 * the csum-enable bits; the device completes the L4 sum in PART mode.
+	 */
+	int do_csum = 0;
+	uint8_t csum_l3_en = 0, csum_l4_en = 0, csum_l4_proto = 0;
+	uint8_t csum_l3_hdr_len = 0, csum_l3_hdr_off = 0, csum_l4_hdr_words = 0;
+	const int csum_flags_out =
+	    (m->m_pkthdr.csum_flags &
+	    (M_IPV4_CSUM_OUT | M_TCP_CSUM_OUT | M_UDP_CSUM_OUT));
 
 	qmask = txq->txq_depth - 1;
 
@@ -2518,6 +2804,98 @@ ena_encap(struct ena_softc *sc, struct mbuf *m)
 	slot = txq->txq_sq_tail & qmask;
 	txs = &txq->txq_slots[slot];
 	map = txs->txs_map;
+
+	/*
+	 * Decide checksum offload BEFORE loading the mbuf for DMA. We must read
+	 * the L2/L3/L4 header bytes (via m_copydata, which is safe across any
+	 * mbuf layout) and, when offloading, force the packet to coalesce so it
+	 * uses at most ONE data descriptor: the LLQ entry has only
+	 * descs_before_header (2) descriptor slots, and a csum packet spends one
+	 * of them on the meta descriptor, leaving room for a single data desc.
+	 */
+	if (csum_flags_out != 0 && txq->txq_llq &&
+	    (sc->sc_tx_csum_l3 || sc->sc_tx_csum_l4)) {
+		uint8_t hp[ETHER_HDR_LEN + 20];		/* L2 + minimal IPv4(20) */
+		uint16_t etype;
+		uint16_t parselen = m->m_pkthdr.len;
+		int l4off;
+
+		if (parselen > sizeof(hp))
+			parselen = sizeof(hp);
+		/* Need at least L2 + a minimal IPv4 header to classify. */
+		if (parselen >= ETHER_HDR_LEN + 20) {
+			m_copydata(m, 0, ETHER_HDR_LEN + 20, hp);
+			etype = (hp[12] << 8) | hp[13];
+			l4off = ETHER_HDR_LEN + 20;
+			/*
+			 * Only untagged IPv4 with ip_hl==5 is offloadable here.
+			 * VLAN-tagged frames (software ETHERTYPE_VLAN header) are
+			 * left to the software-csum fallback to stay safe. The
+			 * OpenBSD stack only leaves M_*_CSUM_OUT set when ip_hl==5,
+			 * so this is the guaranteed-success common case.
+			 */
+			if (etype == ETHERTYPE_IP &&
+			    (hp[ETHER_HDR_LEN] & 0xf0) == 0x40 &&	/* IPv4 */
+			    (hp[ETHER_HDR_LEN] & 0x0f) == 5 &&		/* ip_hl==5 */
+			    m->m_pkthdr.len > l4off) {	/* L4 header present */
+				csum_l3_hdr_off = ETHER_HDR_LEN;
+				csum_l3_hdr_len = 20;
+
+				if ((m->m_pkthdr.csum_flags & M_IPV4_CSUM_OUT) &&
+				    sc->sc_tx_csum_l3)
+					csum_l3_en = 1;
+
+				/*
+				 * PART-mode (non-TSO) csum: l4_hdr_len is 0 in the
+				 * meta descriptor. This matches the device's own
+				 * driver, ena_tx_csum (ena_netdev.c:3185-3188),
+				 * which sets ena_meta->l4_hdr_len = 0 and
+				 * l4_csum_partial = 1 whenever mss == 0; l4_hdr_len
+				 * carries the TCP doff only for TSO. The device
+				 * locates L4 from l3_hdr_offset + l3_hdr_len and
+				 * adds the payload sum to the pre-seeded
+				 * pseudo-header field.
+				 */
+				if ((m->m_pkthdr.csum_flags & M_TCP_CSUM_OUT) &&
+				    sc->sc_tx_csum_l4) {
+					csum_l4_hdr_words = 0;
+					csum_l4_proto = ENA_ETH_IO_L4_PROTO_TCP;
+					csum_l4_en = 1;
+				} else if ((m->m_pkthdr.csum_flags &
+				    M_UDP_CSUM_OUT) && sc->sc_tx_csum_l4) {
+					csum_l4_hdr_words = 0;
+					csum_l4_proto = ENA_ETH_IO_L4_PROTO_UDP;
+					csum_l4_en = 1;
+				}
+
+				if (csum_l3_en || csum_l4_en)
+					do_csum = 1;
+			}
+		}
+
+		/*
+		 * Offload spends one of the LLQ entry's two descriptor slots on
+		 * the meta descriptor, so the payload must fit in a SINGLE data
+		 * descriptor. Coalesce the chain to one DMA segment up front; the
+		 * inline-header skip then leaves at most one residual buffer. If
+		 * m_defrag fails we cannot offload — drop do_csum and fall through
+		 * to the software-checksum path below.
+		 */
+		if (do_csum && m_defrag(m, M_DONTWAIT) != 0)
+			do_csum = 0;
+	}
+
+	/*
+	 * Hardware csum offload here is honored only on the LLQ push path and
+	 * only for untagged IPv4 (ip_hl==5) — the case the OpenBSD stack
+	 * guarantees when it delegates (M_*_CSUM_OUT stays set). The capability
+	 * is therefore advertised only when LLQ is negotiated (see ena_attach),
+	 * so the stack never delegates a packet this path cannot offload. VLAN-
+	 * tagged frames never arrive here delegated either: the driver advertises
+	 * no IFCAP_VLAN_HWTAGGING/HWOFFLOAD, so vlan(4) (if_vlan.c) gives its
+	 * interface no csum capabilities and completes the checksum in software
+	 * before handing the frame down.
+	 */
 
 	/*
 	 * Load the mbuf for DMA. The per-slot map was created with a hard limit
@@ -2569,6 +2947,12 @@ ena_encap(struct ena_softc *sc, struct mbuf *m)
 		uint32_t blen[ENA_TX_MAX_SEGS];
 		uint16_t skip = txq->txq_llq ? header_len : 0;
 		int ndata = 0;
+		/*
+		 * Descriptor slot 0 is the meta descriptor when offloading csum;
+		 * the data descriptors then start at slot 1. Without csum,
+		 * descbase==0 and the layout is byte-for-byte unchanged.
+		 */
+		int descbase = do_csum ? 1 : 0;
 
 		for (b = 0; b < nsegs; b++) {
 			uint64_t sa = map->dm_segs[b].ds_addr;
@@ -2585,6 +2969,21 @@ ena_encap(struct ena_softc *sc, struct mbuf *m)
 		}
 
 		/*
+		 * Offload invariant: a csum packet was m_defrag'd up front to a
+		 * single DMA segment, so after the inline-header skip it has at
+		 * most ONE data buffer (ndata <= 1) and meta(1)+data(1) fit the
+		 * two descriptor slots. A standard Ethernet frame always fits a
+		 * single cluster, so this is unreachable; if it ever trips, drop
+		 * the packet rather than emit a corrupt offload (the caller frees
+		 * m). We cannot software-csum here: the DMA buffers are about to
+		 * be read by the device.
+		 */
+		if (do_csum && ndata > 1) {
+			bus_dmamap_unload(sc->sc_dmat, map);
+			return (EIO);
+		}
+
+		/*
 		 * Emit the descriptors. When the whole packet fit inside the
 		 * inline header (ndata == 0) we still emit ONE descriptor that
 		 * carries FIRST|LAST|COMP_REQ + the header length and no buffer,
@@ -2595,6 +2994,48 @@ ena_encap(struct ena_softc *sc, struct mbuf *m)
 		ndesc = (ndata == 0) ? 1 : ndata;
 
 		memset(entry, 0, ENA_LLQ_ENTRY_SIZE);
+
+		/*
+		 * Meta descriptor (csum offload only). Occupies entry slot 0 and
+		 * carries the L3/L4 layer offsets/lengths the device needs to
+		 * locate L4 in PART mode. mss=0 (no TSO), so MSS_HI/MSS_LO stay
+		 * zero. Mirrors ena_com_create_meta (ena_eth_com.c:354): it sets
+		 * META_DESC|EXT_VALID|ETH_META_TYPE|META_STORE|FIRST|PHASE in
+		 * len_ctrl (NO last, NO comp_req) and packs l3_hdr_len /
+		 * l3_hdr_offset / l4_hdr_len_in_words into word2. The meta desc
+		 * shares the entry's phase and is NOT separately completed by the
+		 * device (one completion per packet, on the last data desc).
+		 */
+		if (do_csum) {
+			struct ena_eth_io_tx_meta_desc *meta;
+			uint32_t mlen_ctrl, mword2;
+
+			mlen_ctrl =
+			    ENA_ETH_IO_TX_META_DESC_LEN_CTRL_META_DESC_MASK |
+			    ENA_ETH_IO_TX_META_DESC_LEN_CTRL_EXT_VALID_MASK |
+			    ENA_ETH_IO_TX_META_DESC_LEN_CTRL_ETH_META_TYPE_MASK |
+			    ENA_ETH_IO_TX_META_DESC_LEN_CTRL_META_STORE_MASK |
+			    ENA_ETH_IO_TX_META_DESC_LEN_CTRL_FIRST_MASK |
+			    (((uint32_t)txq->txq_sq_phase <<
+			    ENA_ETH_IO_TX_META_DESC_LEN_CTRL_PHASE_SHIFT) &
+			    ENA_ETH_IO_TX_META_DESC_LEN_CTRL_PHASE_MASK);
+
+			mword2 =
+			    ((uint32_t)csum_l3_hdr_len &
+			    ENA_ETH_IO_TX_META_DESC_WORD2_L3_HDR_LEN_MASK) |
+			    (((uint32_t)csum_l3_hdr_off <<
+			    ENA_ETH_IO_TX_META_DESC_WORD2_L3_HDR_OFF_SHIFT) &
+			    ENA_ETH_IO_TX_META_DESC_WORD2_L3_HDR_OFF_MASK) |
+			    (((uint32_t)csum_l4_hdr_words <<
+			    ENA_ETH_IO_TX_META_DESC_WORD2_L4_HDR_LEN_IN_WORDS_SHIFT) &
+			    ENA_ETH_IO_TX_META_DESC_WORD2_L4_HDR_LEN_IN_WORDS_MASK);
+
+			meta = (struct ena_eth_io_tx_meta_desc *)entry;
+			meta->len_ctrl = htole32(mlen_ctrl);
+			meta->word1 = 0;
+			meta->word2 = htole32(mword2);
+			meta->reserved = 0;
+		}
 
 		for (i = 0; i < ndesc; i++) {
 			len_ctrl = (txq->txq_sq_phase <<
@@ -2614,10 +3055,16 @@ ena_encap(struct ena_softc *sc, struct mbuf *m)
 			}
 
 			if (i == 0) {
-				/* First descriptor: FIRST, COMP_REQ, req_id, and
-				 * (LLQ) the inline header length. */
-				len_ctrl |= ENA_ETH_IO_TX_DESC_FIRST_MASK |
-				    ENA_ETH_IO_TX_DESC_COMP_REQ_MASK;
+				/*
+				 * First data descriptor: COMP_REQ, req_id, and
+				 * (LLQ) the inline header length. FIRST is set
+				 * here ONLY when there is no meta descriptor;
+				 * with csum the meta desc owns FIRST (mirrors
+				 * ena_eth_com.c:502 "if (!have_meta) set FIRST").
+				 */
+				if (!do_csum)
+					len_ctrl |= ENA_ETH_IO_TX_DESC_FIRST_MASK;
+				len_ctrl |= ENA_ETH_IO_TX_DESC_COMP_REQ_MASK;
 				/*
 				 * req_id split across two words exactly as
 				 * ena_com_prepare_tx encodes it (ena_eth_com.c:
@@ -2634,12 +3081,38 @@ ena_encap(struct ena_softc *sc, struct mbuf *m)
 					addr_hi_hdr |= ((uint32_t)header_len <<
 					ENA_ETH_IO_TX_DESC_HEADER_LENGTH_SHIFT) &
 					ENA_ETH_IO_TX_DESC_HEADER_LENGTH_MASK;
+				/*
+				 * Checksum-enable bits ride in this same meta_ctrl
+				 * word (they occupy bits 0-17; REQ_ID_LO is bits
+				 * 31:22, no overlap). Mirrors the ena_tx_ctx
+				 * meta_valid block (ena_eth_com.c:520-534). L3
+				 * proto is set to IPv4 whenever L4 csum is enabled
+				 * so the device can locate L4 even if the IPv4
+				 * header csum itself was not requested. PART mode
+				 * (l4_csum_partial=1) tells the device to ADD the
+				 * payload sum to the pre-seeded pseudo-header field.
+				 */
+				if (csum_l3_en)
+					meta_ctrl |=
+					    ENA_ETH_IO_TX_DESC_L3_CSUM_EN_MASK;
+				if (csum_l4_en) {
+					meta_ctrl |= ((uint32_t)
+					    ENA_ETH_IO_L3_PROTO_IPV4 &
+					    ENA_ETH_IO_TX_DESC_L3_PROTO_IDX_MASK);
+					meta_ctrl |= (((uint32_t)csum_l4_proto <<
+					    ENA_ETH_IO_TX_DESC_L4_PROTO_IDX_SHIFT) &
+					    ENA_ETH_IO_TX_DESC_L4_PROTO_IDX_MASK);
+					meta_ctrl |=
+					    ENA_ETH_IO_TX_DESC_L4_CSUM_EN_MASK;
+					meta_ctrl |=
+					    ENA_ETH_IO_TX_DESC_L4_CSUM_PARTIAL_MASK;
+				}
 			}
 			if (i == ndesc - 1)
 				len_ctrl |= ENA_ETH_IO_TX_DESC_LAST_MASK;
 
 			desc = (struct ena_eth_io_tx_desc *)
-			    (entry + i * ENA_TX_DESC_SIZE);
+			    (entry + (descbase + i) * ENA_TX_DESC_SIZE);
 			desc->len_ctrl = htole32(len_ctrl);
 			desc->meta_ctrl = htole32(meta_ctrl);
 			desc->buff_addr_lo = htole32(addr_lo);
@@ -2679,46 +3152,93 @@ ena_encap(struct ena_softc *sc, struct mbuf *m)
 		    sc->sc_llq_entry_size, BUS_SPACE_BARRIER_WRITE);
 	} else {
 		/*
-		 * Host-memory fallback: copy the descriptors into the host SQ
-		 * ring slot and PREWRITE-sync it so the device's read behind the
-		 * doorbell sees them.
+		 * Host-memory placement: the device's SQ tail counts
+		 * DESCRIPTORS, not entries (unlike LLQ). Write each descriptor
+		 * into its OWN ring slot (with ring wrap), carrying the PHASE
+		 * valid for that slot, and PREWRITE-sync it. The entry holds
+		 * ndesc data descriptors (no meta desc: csum offload is LLQ-only,
+		 * so do_csum==0 here and descbase==0). The per-descriptor tail
+		 * and phase are advanced here; the doorbell below rings that
+		 * descriptor tail. Mirrors the host submission in
+		 * ena_com_prepare_tx (ena_eth_com.c:241-258): one descriptor per
+		 * slot, per-descriptor phase, tail += ndesc.
+		 *
+		 * (The old fallback memcpy'd ndesc descriptors into one slot and
+		 * stepped the tail by 1 — correct only for single-descriptor
+		 * packets; a multi-segment packet desynced the SQ tail/phase and
+		 * the device raised DEV_STS FATAL.)
 		 */
 		struct ena_eth_io_tx_desc *ring =
 		    (struct ena_eth_io_tx_desc *)ENA_DMA_KVA(&txq->txq_sq_dma);
+		uint16_t t = txq->txq_sq_tail;
+		uint8_t ph = txq->txq_sq_phase;
 
-		memcpy(&ring[slot], entry, ndesc * ENA_TX_DESC_SIZE);
-		bus_dmamap_sync(sc->sc_dmat, ENA_DMA_MAP(&txq->txq_sq_dma),
-		    slot * ENA_TX_DESC_SIZE, ndesc * ENA_TX_DESC_SIZE,
-		    BUS_DMASYNC_PREWRITE);
+		for (i = 0; i < ndesc; i++) {
+			struct ena_eth_io_tx_desc *src =
+			    (struct ena_eth_io_tx_desc *)
+			    (entry + i * ENA_TX_DESC_SIZE);
+			uint16_t rs = t & qmask;
+			uint32_t lc = letoh32(src->len_ctrl);
+
+			/* Re-stamp PHASE for this descriptor's actual slot. */
+			lc &= ~ENA_ETH_IO_TX_DESC_PHASE_MASK;
+			lc |= ((uint32_t)ph <<
+			    ENA_ETH_IO_TX_DESC_PHASE_SHIFT) &
+			    ENA_ETH_IO_TX_DESC_PHASE_MASK;
+
+			ring[rs].len_ctrl = htole32(lc);
+			ring[rs].meta_ctrl = src->meta_ctrl;
+			ring[rs].buff_addr_lo = src->buff_addr_lo;
+			ring[rs].buff_addr_hi_hdr_sz = src->buff_addr_hi_hdr_sz;
+
+			bus_dmamap_sync(sc->sc_dmat,
+			    ENA_DMA_MAP(&txq->txq_sq_dma),
+			    rs * ENA_TX_DESC_SIZE, ENA_TX_DESC_SIZE,
+			    BUS_DMASYNC_PREWRITE);
+
+			t++;
+			if ((t & qmask) == 0)
+				ph ^= 1;
+		}
+
+		/* Per-descriptor producer advance (host placement). */
+		txq->txq_sq_tail = t;
+		txq->txq_sq_phase = ph;
+		txq->txq_sq_avail -= ndesc;	/* freed in ena_txeof */
 	}
 
-	/* Stash the mbuf + map for reclaim in ena_txeof, keyed by slot. */
+	/* Stash the mbuf + map for reclaim in ena_txeof, keyed by slot. The
+	 * descriptor count lets ena_txeof return the SQ slots to txq_sq_avail. */
 	txs->txs_m = m;
+	txs->txs_ndesc = ndesc;
 
 	/*
-	 * Advance the SQ producer by ONE ENTRY (not one per descriptor).
+	 * Advance the SQ producer and ring the doorbell.
 	 *
-	 * CRITICAL: for LLQ the device's SQ tail counts ENTRIES, not
-	 * descriptors. ena_com increments io_sq->tail exactly once per LLQ entry
-	 * written to the window (ena_com_write_bounce_buffer_to_dev,
-	 * ena_eth_com.c:127), regardless of how many 16-byte descriptors that
-	 * 128-byte entry packs. The window index and the doorbell value are both
-	 * this entry tail (dst_tail_mask = tail & (q_depth-1), ena_eth_com.c:102;
-	 * writel(tail, db) in ena_com_write_tx_sq_doorbell, ena_eth_com.h:193).
-	 * Our Phase-1 single-entry-per-packet invariant means one entry == one
-	 * packet, so the tail (and thus the slot index reused next round) steps
-	 * by 1. The phase flips on entry-ring wrap.
+	 * LLQ: the device's SQ tail counts ENTRIES (one 128B entry per packet,
+	 * regardless of how many 16-byte descriptors it packs). ena_com steps
+	 * io_sq->tail once per entry (ena_com_write_bounce_buffer_to_dev,
+	 * ena_eth_com.c:127); doorbell = entry tail (ena_eth_com.h:193). Our
+	 * single-entry-per-packet invariant => tail steps by 1, phase flips on
+	 * entry-ring wrap.
 	 *
-	 * For the host-mem fallback, each packet currently also occupies one
-	 * starting slot; multi-descriptor host SQ rings would need a per-descr
-	 * tail, but the fallback is not exercised on Graviton (LLQ is required).
+	 * HOST placement: the SQ tail counts DESCRIPTORS, so the host branch
+	 * above already advanced txq_sq_tail by ndesc and stamped each
+	 * descriptor's per-slot phase (ena_eth_com.c:241-258); here we only
+	 * ring the doorbell with that descriptor tail.
+	 *
+	 * NOTE: txq_prod/txq_cons cap in-flight PACKETS at depth-1; host
+	 * placement still needs a descriptor-occupancy guard before heavy
+	 * multi-segment load can fill the SQ ring (TODO: gate accept on ndesc
+	 * vs free descriptors). Light traffic (DHCP/SSH) cannot fill it.
 	 */
-	txq->txq_sq_tail++;
-	if ((txq->txq_sq_tail & qmask) == 0)
-		txq->txq_sq_phase ^= 1;
+	if (txq->txq_llq) {
+		txq->txq_sq_tail++;
+		if ((txq->txq_sq_tail & qmask) == 0)
+			txq->txq_sq_phase ^= 1;
+	}
 	txq->txq_prod = (txq->txq_prod + 1) & qmask;
 
-	/* Ring the TX SQ doorbell with the new monotonic entry tail. */
 	ENA_REG_WR32_DB(sc, txq->txq_sq_db, txq->txq_sq_tail);
 
 	return (0);
@@ -2809,6 +3329,10 @@ ena_txeof(struct ena_softc *sc)
 		m_freem(txs->txs_m);
 		txs->txs_m = NULL;
 
+		/* Return this packet's SQ descriptor slots (host placement). */
+		if (!txq->txq_llq)
+			txq->txq_sq_avail += txs->txs_ndesc;
+
 		txq->txq_cons = (txq->txq_cons + 1) & qmask;
 		txfree++;
 	}
@@ -2828,11 +3352,13 @@ ena_txeof(struct ena_softc *sc)
 	}
 
 	/*
-	 * Re-arm the TX CQ interrupt using ITS OWN unmask offset (distinct from
-	 * the RX CQ's). Done unconditionally to match ena_netdev.c, which
-	 * unmasks after every poll completion.
+	 * Do NOT re-arm the shared IO MSI-X vector here. ena_intr_io drains TX
+	 * (this function) then RX (ena_rx_intr -> ena_rxeof), and ena_rxeof issues
+	 * a single unmask at the very end of the handler -- mirroring FreeBSD
+	 * ena_cleanup. Re-arming mid-handler here too (a second unmask of the same
+	 * shared vector) raced the device's per-vector mask and could leave the
+	 * vector silent after the first burst (data path dies after ~20 packets).
 	 */
-	ena_cq_unmask(sc, txq->txq_unmask_off);
 
 	return (txfree);
 }
@@ -2887,6 +3413,25 @@ ena_init(struct ena_softc *sc)
 
 	SET(ifp->if_flags, IFF_RUNNING);
 	ifq_clr_oactive(&ifp->if_snd);
+
+	/*
+	 * Re-assert the cached carrier from sc_link_up: the device sends a
+	 * LINK_CHANGE AENQ event only on real transitions, not after a host-side
+	 * down/up re-init, so without this an up'd interface would read
+	 * "no carrier" even while traffic flows. ena_link_state pushes only if
+	 * the state actually differs. THE down/up link-state fix.
+	 */
+	ena_link_state(sc);
+
+	/*
+	 * Arm the watchdog: refresh the keep-alive timestamp so a just-up
+	 * interface is not seen as instantly stale, then start the 1 Hz tick
+	 * (only when enabled at attach). ena_stop cancels it on the way down.
+	 */
+	sc->sc_keepalive_last = getuptime();
+	if (sc->sc_wd_active)
+		timeout_add_sec(&sc->sc_wd_tick, ENA_WATCHDOG_HZ);
+
 	return (0);
 }
 
@@ -2908,9 +3453,280 @@ ena_stop(struct ena_softc *sc)
 	ifq_clr_oactive(&ifp->if_snd);
 	ifq_barrier(&ifp->if_snd);
 
+	/*
+	 * Cancel the watchdog callout so it stops sampling while the interface
+	 * is down (ena_init re-arms on the next up). Plain timeout_del, not
+	 * _barrier: ena_tick only reads MMIO/timestamps, sets a flag, and logs --
+	 * it never touches the rings being torn down below, so it is safe to let
+	 * a final in-flight tick complete.
+	 */
 	timeout_del(&rxq->rxq_refill);
+	timeout_del(&sc->sc_wd_tick);
 	ena_tx_destroy(sc);
 	ena_rx_destroy(sc);
+}
+
+/*
+ * ena_tick -- watchdog callout (Increment 1: DETECTION ONLY, no reset).
+ *
+ * Runs in SOFTCLOCK at ENA_WATCHDOG_HZ. It MUST NOT sleep, take NET_LOCK,
+ * poll the admin queue, or reset the device. It only: (1) checks keep-alive
+ * staleness (when KEEP_ALIVE was subscribed), (2) does a single softclock-legal
+ * DEV_STS MMIO read for FATAL_ERROR / loss of READY, sets ENA_FLAG_TRIGGER_RESET
+ * and logs on a fault, then (3) always re-arms. Increment 2 will task_add the
+ * actual reset off the flag; here detection cannot wedge the device.
+ */
+void
+ena_tick(void *xsc)
+{
+	struct ena_softc *sc = xsc;
+	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	uint32_t sts, delta;
+
+	if (!ISSET(ifp->if_flags, IFF_RUNNING))
+		return;	/* not armed when down; ena_init re-arms on next up */
+
+	/*
+	 * Skip all device access while a reset is mid-rebuild. The reset task
+	 * reads/writes device registers through the single readless-MMIO response
+	 * region; a concurrent DEV_STS read here would corrupt that shared slot,
+	 * and reading the transient FATAL/!READY of a device mid-reset would set
+	 * ENA_FLAG_TRIGGER_RESET in a race with the task clearing it -> reset loop.
+	 * The reset re-arms the tick (via ena_init) when it brings the queues back.
+	 */
+	if (ISSET(sc->sc_flags, ENA_FLAG_RESETTING)) {
+		timeout_add_sec(&sc->sc_wd_tick, ENA_WATCHDOG_HZ);
+		return;
+	}
+
+	/*
+	 * Drain the AENQ from the tick (FreeBSD ena_timer_service style). On the
+	 * native EC2 VF the mgmt MSI-X stops delivering after early boot, so the
+	 * keep-alive AENQ would otherwise go unserviced and the device's own
+	 * liveness watchdog faults it (DEV_STS FATAL). Draining here every second
+	 * keeps keep-alive serviced + the head doorbell rung regardless of the
+	 * mgmt interrupt. ena_aenq_intr takes sc_aenq_mtx to serialize vs the ISR.
+	 */
+	ena_aenq_intr(sc);
+
+	/*
+	 * Post-reset cooldown: for ENA_WD_COOLDOWN_S after a recovery the device
+	 * re-stabilises and DEV_STS reads transient FATAL/!READY. Watchdog'ing in
+	 * that window re-triggers a reset before the device settles -> a reset
+	 * storm (which can physically wedge the device). Stay quiet until it ends;
+	 * keep-alive timestamps still update from the AENQ ISR meanwhile.
+	 */
+	if ((uint32_t)getuptime() < sc->sc_wd_cooldown) {
+		sc->sc_wd_fatal_count = 0;
+		/*
+		 * Keep the keep-alive baseline fresh through the cooldown: the device's
+		 * keep-alive cadence is jittery for several seconds after a reset, so a
+		 * stale timestamp would trip the keep-alive check the instant the
+		 * cooldown lifts. The real AENQ keep-alive ISR overwrites this with its
+		 * own timestamp as events resume.
+		 */
+		sc->sc_keepalive_last = getuptime();
+		timeout_add_sec(&sc->sc_wd_tick, ENA_WATCHDOG_HZ);
+		return;
+	}
+
+	/* keep-alive staleness (only if KEEP_ALIVE was negotiated) */
+	if (sc->sc_keepalive_timeo != 0) {
+		delta = (uint32_t)getuptime() - sc->sc_keepalive_last;
+		if (delta > sc->sc_keepalive_timeo) {
+			SET(sc->sc_flags, ENA_FLAG_TRIGGER_RESET);
+			printf("%s: watchdog: no keep-alive for %us\n",
+			    sc->sc_dev.dv_xname, delta);
+		}
+	}
+
+	/*
+	 * Device-fatal: a single softclock-legal MMIO read, DEBOUNCED. A device
+	 * is transiently FATAL/!READY for a tick or two right after a reset while
+	 * it re-stabilises; reacting to that would start a reset storm (each reset
+	 * induces the next). Require ENA_WD_FATAL_THRESH consecutive bad reads --
+	 * a genuinely wedged device stays bad, a recovering one clears within one
+	 * or two ticks.
+	 */
+	sts = ENA_REG_RD32(sc, ENA_REGS_DEV_STS_OFF);
+	if (sts == 0xffffffff ||
+	    (sts & ENA_REGS_DEV_STS_FATAL_ERROR_MASK) ||
+	    !(sts & ENA_REGS_DEV_STS_READY_MASK)) {
+		if (++sc->sc_wd_fatal_count >= ENA_WD_FATAL_THRESH) {
+			SET(sc->sc_flags, ENA_FLAG_TRIGGER_RESET);
+			printf("%s: watchdog: device fatal (sts=0x%x)\n",
+			    sc->sc_dev.dv_xname, sts);
+		}
+	} else
+		sc->sc_wd_fatal_count = 0;
+
+	/*
+	 * INCREMENT 2: enqueue the reset off the trigger flag. Guarded so it
+	 * fires once and never while a reset is mid-rebuild (RESETTING) or the
+	 * device is detaching (DYING). The reset task clears TRIGGER_RESET when
+	 * it runs; the tick keeps running regardless. ena_tick stays softclock-
+	 * safe -- it only flags, task_add's, and re-arms (no sleep/NET_LOCK/
+	 * admin/reset).
+	 */
+	if (0 /* XXX TEST: auto-reset gated off — detect+log FATAL, no reset loop */ &&
+	    ISSET(sc->sc_flags, ENA_FLAG_TRIGGER_RESET) &&
+	    !ISSET(sc->sc_flags, ENA_FLAG_RESETTING) &&
+	    !ISSET(sc->sc_flags, ENA_FLAG_DYING))
+		task_add(systq, &sc->sc_reset_task);
+
+	timeout_add_sec(&sc->sc_wd_tick, ENA_WATCHDOG_HZ);	/* always re-arm */
+}
+
+/*
+ * ena_destroy_device -- quiesce the (possibly wedged) device before a rebuild.
+ *
+ * Process context, NET_LOCK held (called from ena_reset_task). Records whether
+ * the interface was up so ena_restore_device knows whether to bring IO back,
+ * masks the AENQ/mgmt ISR window (mirroring ena_detach), tears the IO queues
+ * down if they were live, then runs the reset primitive. ena_stop tolerates an
+ * admin-poll timeout on a wedged device; ena_reset busy-polls up to ~1s, which
+ * is legal in process context (and would be illegal in the softclock tick).
+ *
+ * What it does NOT touch: the admin AQ/ACQ rings, the AENQ ring, the MMIO resp
+ * region, the host-attr page, and the BAR2 LLQ window all persist across the
+ * reset (allocated/mapped once at attach, freed only at detach). ena_reset
+ * does not free or unmap any of them, and ena_restore_device re-programs the
+ * device from those same persistent buffers -- so destroy must NOT free them
+ * (see ena_restore_device's idempotency note).
+ */
+void
+ena_destroy_device(struct ena_softc *sc, int *was_up)
+{
+	struct ifnet *ifp = &sc->sc_ac.ac_if;
+
+	*was_up = ISSET(ifp->if_flags, IFF_RUNNING);
+
+	/*
+	 * Close the AENQ/mgmt ISR window before resetting, exactly as ena_detach
+	 * does (ENA_REGS_ADMIN_INTR_MASK masks the management interrupt). The
+	 * device is about to be reset; no AENQ events should be serviced against
+	 * a ring the reset is dropping.
+	 */
+	ENA_REG_WR32(sc, ENA_REGS_INTR_MASK_OFF, ENA_REGS_ADMIN_INTR_MASK);
+
+	/*
+	 * If the interface was up, take the IO queues down over the still-live
+	 * admin queue (DESTROY_SQ/CQ). On a wedged device the admin polls may
+	 * time out; ena_stop tolerates that and still clears IFF_RUNNING and
+	 * frees the IO rings/clusters.
+	 */
+	if (*was_up)
+		ena_stop(sc);
+
+	/* The reset primitive; busy-polls up to ~1s (legal in process ctx). */
+	ena_reset(sc);
+}
+
+/*
+ * ena_restore_device -- replay the attach bring-up after a reset.
+ *
+ * Process context, NET_LOCK held. Re-runs device+admin+AENQ init, re-commits
+ * LLQ, refreshes the keep-alive timestamp, and brings IO back if it had been
+ * up. Returns 0 on success, 1 on any failure (caller logs "device down").
+ *
+ * IDEMPOTENCY (the critical correctness point):
+ *   ena_admin_init is SAFE TO CALL A SECOND TIME. It allocates NOTHING: it
+ *   only resets host-side scalar ring state (sc_aq_tail/sc_acq_head/phases/
+ *   cmd_id) and re-programs the AQ/ACQ/AENQ BAR registers from the DMA buffers
+ *   ena_attach allocated once (sc_aq_dma, sc_acq_dma, sc_aenq_dma) -- buffers
+ *   that ena_reset/ena_stop never free. ena_aenq_register (called inside
+ *   ena_admin_init) likewise only re-seeds scalars + re-programs the AENQ ring
+ *   base/caps; it allocates nothing. Therefore ena_destroy_device must NOT free
+ *   admin/AENQ DMA state (and it does not): if it did, this re-init would
+ *   re-program the BAR from freed memory. Re-running it is exactly the intended
+ *   "re-init the admin/AENQ rings" behaviour.
+ *
+ *   ena_set_host_attr re-uses its already-allocated page (alloc guarded on
+ *   edm_map == NULL); ena_get_dev_attr is a harmless re-read of MAC/MTU/offload
+ *   caps (we do NOT re-run ifmedia/if_attach); ena_tx_llq_setup re-commits LLQ
+ *   over the still-mapped BAR2; ena_aenq_init re-subscribes groups, unmasks the
+ *   mgmt INTR and rings the AENQ head doorbell, refreshing sc_aenq_groups.
+ *
+ *   ena_reset already does the MMIO resp-addr write internally (ena_mmio_resp_
+ *   write, after the reset trigger), so restore starts at ena_admin_init, not
+ *   at the resp write.
+ */
+int
+ena_restore_device(struct ena_softc *sc, int was_up)
+{
+	if (ena_admin_init(sc) != 0)
+		goto fail;
+	if (ena_set_host_attr(sc) != 0)
+		goto fail;
+	if (ena_get_dev_attr(sc) != 0)	/* re-reads MAC/MTU/offload; harmless */
+		goto fail;
+	if (ena_tx_llq_setup(sc) != 0)	/* CORRECTION 1: re-commit LLQ post-reset */
+		goto fail;
+	if (ena_aenq_init(sc) != 0)	/* re-subscribe, unmask mgmt INTR, ring DB */
+		goto fail;
+
+	/* Fresh stamp so the watchdog does not see the device as instantly stale. */
+	sc->sc_keepalive_last = getuptime();
+
+	if (was_up) {
+		/*
+		 * Re-create the IO queues (CREATE_CQ/SQ), re-assert link state and
+		 * re-arm the tick -- the same path a manual down/up takes. NB: the IO
+		 * data-path restore after a reset cannot be validated on the nested-VFIO
+		 * test harness, where a post-reset boot re-rolls the host-side MSI-X
+		 * delivery race that intermittently drops the IO interrupt; confirming
+		 * recovery end-to-end needs native ena0 on real EC2.
+		 */
+		if (ena_init(sc) != 0)	/* re-create RX/TX queues, link state, tick */
+			goto fail;
+	} else {
+		ena_link_state(sc);	/* re-assert carrier even if admin-only */
+	}
+
+	/*
+	 * Give the freshly-rebuilt device a cooldown before the watchdog reads it
+	 * again: DEV_STS reads transient FATAL/!READY for a few seconds post-reset,
+	 * and re-triggering in that window storms (and can wedge the device).
+	 */
+	sc->sc_wd_fatal_count = 0;
+	sc->sc_wd_cooldown = (uint32_t)getuptime() + ENA_WD_COOLDOWN_S;
+	return (0);
+fail:
+	return (1);
+}
+
+/*
+ * ena_reset_task -- process-context device reset/recovery (the watchdog's
+ * action). Enqueued on systq by ena_tick when ENA_FLAG_TRIGGER_RESET is set.
+ * May sleep; takes NET_LOCK because ena_init/ena_stop are ifnet-path functions
+ * that expect it held. Single-entry: RESETTING guards re-entry, DYING aborts a
+ * reset racing detach, and the task clears TRIGGER_RESET on the way out.
+ */
+void
+ena_reset_task(void *xsc)
+{
+	struct ena_softc *sc = xsc;
+	int was_up;
+
+	NET_LOCK();
+	if (ISSET(sc->sc_flags, ENA_FLAG_DYING) ||
+	    !ISSET(sc->sc_flags, ENA_FLAG_TRIGGER_RESET) ||
+	    ISSET(sc->sc_flags, ENA_FLAG_RESETTING)) {
+		NET_UNLOCK();
+		return;
+	}
+	SET(sc->sc_flags, ENA_FLAG_RESETTING);
+	printf("%s: resetting device (recovery)\n", sc->sc_dev.dv_xname);
+	ena_destroy_device(sc, &was_up);
+	if (ena_restore_device(sc, was_up) != 0) {
+		printf("%s: reset recovery failed; device down\n",
+		    sc->sc_dev.dv_xname);
+		CLR(sc->sc_flags, ENA_FLAG_TRIGGER_RESET | ENA_FLAG_RESETTING);
+		NET_UNLOCK();
+		return;
+	}
+	CLR(sc->sc_flags, ENA_FLAG_TRIGGER_RESET | ENA_FLAG_RESETTING);
+	NET_UNLOCK();
 }
 
 /*
@@ -2946,8 +3762,16 @@ ena_start(struct ifqueue *ifq)
 	qmask = txq->txq_depth - 1;
 
 	for (;;) {
-		/* Stop before the ring is full (keep one slot free). */
-		if (((txq->txq_prod + 1) & qmask) == (txq->txq_cons & qmask)) {
+		/*
+		 * Stop before the ring is full (keep one packet slot free). For
+		 * host placement also stop when fewer than ENA_TX_MAX_SEGS SQ
+		 * descriptor slots remain free, so any packet we dequeue is
+		 * guaranteed to fit (a multi-segment packet uses up to
+		 * ENA_TX_MAX_SEGS descriptors; LLQ packs one entry per packet and
+		 * leaves txq_sq_avail unused).
+		 */
+		if (((txq->txq_prod + 1) & qmask) == (txq->txq_cons & qmask) ||
+		    (!txq->txq_llq && txq->txq_sq_avail < ENA_TX_MAX_SEGS)) {
 			ifq_set_oactive(ifq);
 			break;
 		}
@@ -2986,6 +3810,31 @@ ena_start(struct ifqueue *ifq)
 			ifp->if_oerrors++;
 			continue;
 		}
+	}
+}
+
+/*
+ * ena_link_state -- push the cached sc_link_up to the ifnet layer.
+ *
+ * Single funnel for carrier changes: it sets if_link_state from sc_link_up
+ * (full-duplex when up, down otherwise) and only calls if_link_state_change
+ * (which itself defers the heavy work via task_add) when the state actually
+ * changed. Called from the AENQ LINK_CHANGE path (after the drain loop) and
+ * from ena_init to re-assert the cached carrier after a host re-init (the
+ * device does not re-send LINK_CHANGE after a down/up, so without this an
+ * up'd interface would read "no carrier" even while traffic flows). Runs in
+ * process context (ena_init) or the post-drain mgmt-ISR tail, mirroring
+ * vio_link_state (if_vio.c:963-978).
+ */
+void
+ena_link_state(struct ena_softc *sc)
+{
+	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	int nstate = sc->sc_link_up ? LINK_STATE_FULL_DUPLEX : LINK_STATE_DOWN;
+
+	if (ifp->if_link_state != nstate) {
+		ifp->if_link_state = nstate;
+		if_link_state_change(ifp);
 	}
 }
 

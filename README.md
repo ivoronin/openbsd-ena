@@ -7,12 +7,12 @@ reason OpenBSD/arm64 cannot run as a native EC2 guest: the instance boots, comes
 up, and finds no network interface it understands. This is an effort to fix that.
 
 > **Status: experimental, single-developer, not upstreamed.** The hard part —
-> the device bring-up and data path — **works on real hardware**: on a live EC2
-> Graviton2 (`t4g`) instance the driver attaches, creates its IO queues, brings
-> the link up, and moves packets in both directions (a DHCP `DISCOVER`/`OFFER`
-> round-trip completes). It is **not** production-ready, not reviewed by OpenBSD,
-> and not yet a thing you would deploy. See [What "working" means](#what-working-means)
-> for the exact line between the two.
+> the device bring-up and data path — **works on real hardware**: a full
+> OpenBSD/arm64 disk install now **boots natively on a live EC2 Graviton2 (`t4g`)
+> instance**, brings `ena0` up as its only NIC, gets a DHCP lease, comes up
+> multiuser, and is reachable over **SSH** — no QEMU shim. It is **not**
+> production-ready, not reviewed by OpenBSD, and not yet a thing you would deploy.
+> See [What "working" means](#what-working-means) for the exact line between the two.
 
 The full story of building and debugging this is written up in two posts:
 - [The OS That Couldn't See the Network](https://tinycomputers.io/posts/the-os-that-couldnt-see-the-network-native-openbsd-arm64-on-aws-graviton/) — why OpenBSD can't run natively on Graviton, and the QEMU-on-metal workaround that came first.
@@ -161,28 +161,30 @@ the first is true today.
 - attach, reset, admin queue, host attributes, device attributes, AENQ, and IO
   queue creation all complete; `DEV_STS` stays healthy through bring-up
 - the link comes up and AENQ keep-alive events flow
-- **TX and RX work** — packets the device really puts on / takes off the wire; a
-  DHCP `DISCOVER`/`OFFER` round-trip completes
+- **TX and RX work** — packets the device really puts on / takes off the wire
+- **a full disk-installed OpenBSD/arm64 boots natively** with `ena0` as its only
+  NIC: it gets its DHCP lease, comes up multiuser, runs `sshd`, and accepts
+  **SSH logins over `ena0`** — the milestone that retires the QEMU-shim build server
+- IPv4 TX/RX checksum offload, gated on the device's reported feature
 - compiles under `-Werror`; the data path is the normal `ifnet`/`ifq` path
 
 **What does not work yet / is unverified:**
-- **No full native install.** Testing boots the `bsd.rd` install ramdisk, not a
-  disk-installed OpenBSD that comes up multiuser with `ena0` as its primary NIC
-  and lets you SSH in over it. That milestone — the one that would retire the
-  QEMU-shim build server — is not done.
-- **Robustness is thin.** One DHCP round-trip is not throughput, multi-queue,
-  checksum offload, MTU changes, link flaps, or days of uptime.
-- **No device reset / recovery.** There is no keep-alive watchdog driving a
-  device reset if the link or device wedges (FreeBSD/Linux have this; it's a
-  Phase-2 concern).
+- **Robustness is thin.** A working SSH session is not throughput, multi-queue,
+  MTU/jumbo, link flaps, or days of uptime — none of that is characterized yet.
+- **TX uses host-memory placement on this VF.** The Graviton `t4g` VF exposes no
+  LLQ memory BAR, so TX descriptors go through a host-memory SQ (per-descriptor
+  submission); the LLQ push path is implemented but unexercised on this hardware.
+- **Device reset / recovery is detection-only.** A keep-alive / `DEV_STS`
+  watchdog detects a wedged device and logs it, but the automatic device-reset
+  recovery is gated off pending end-to-end validation on native hardware.
 - **Not reviewed, not upstreamed.** No OpenBSD developer has looked at it; it has
   not been submitted to `tech@` and would need cleanup and review first. The
   per-file license headers carry an empty `$OpenBSD$` tag as a placeholder, not a
   claim of inclusion.
 
 In short: the genuinely hard, genuinely doubted thing — does a from-scratch ENA
-implementation function on real hardware — is answered **yes**. Turning that into
-something you'd run is future work.
+implementation boot OpenBSD natively on Graviton and carry a real SSH session —
+is answered **yes**. Hardening it into something you'd deploy is future work.
 
 ## Provenance and licensing
 
@@ -201,9 +203,14 @@ to the exact `ena-com`/FreeBSD line it was transcribed from, and
 
 - **Phase 0 — attach** ✓ — PCI attach, admin queue, read device attributes (real EC2)
 - **Phase 1 — data path** ✓ — IO queues, link, TX/RX, DHCP round-trip (real EC2 Graviton2)
-- **Phase 2 — make it real** — userland-driven `dhclient`/`ping` from a full
-  install; keep-alive watchdog + device reset/recovery; multi-queue; offloads;
-  MTU/jumbo; stress/soak; cleanup and a submission to OpenBSD `tech@`
+- **Phase 1.5 — native install** ✓ — a full disk-installed OpenBSD/arm64 boots on
+  a real `t4g` with `ena0` as its only NIC and **SSH-in works**; IPv4 checksum
+  offload; keep-alive/`DEV_STS` watchdog (detection). (Booting natively also needed
+  a separate nvme(4) queue-size fix and an SPCR serial-console fix — both in
+  `contrib/openbsd-patches/`, submittable to `tech@` on their own.)
+- **Phase 2 — make it real** — automatic device reset/recovery (under validation);
+  multi-queue; MTU/jumbo; throughput + stress/soak; cleanup and a submission to
+  OpenBSD `tech@`
 
 ## Credits
 
