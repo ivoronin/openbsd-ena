@@ -174,9 +174,11 @@ the first is true today.
 - **TX uses host-memory placement on this VF.** The Graviton `t4g` VF exposes no
   LLQ memory BAR, so TX descriptors go through a host-memory SQ (per-descriptor
   submission); the LLQ push path is implemented but unexercised on this hardware.
-- **Device reset / recovery is detection-only.** A keep-alive / `DEV_STS`
-  watchdog detects a wedged device and logs it, but the automatic device-reset
-  recovery is gated off pending end-to-end validation on native hardware.
+- **Device reset / recovery does not work yet.** A keep-alive / `DEV_STS`
+  watchdog detects a wedged device and logs it, but automatic device-reset
+  recovery is gated off: on native hardware a host-initiated device reset leaves
+  the device in `DEV_STS` FATAL and the data path does not come back, so
+  auto-reset would only storm. Restoring the data path after a reset is unsolved.
 - **Not reviewed, not upstreamed.** No OpenBSD developer has looked at it; it has
   not been submitted to `tech@` and would need cleanup and review first. The
   per-file license headers carry an empty `$OpenBSD$` tag as a placeholder, not a
