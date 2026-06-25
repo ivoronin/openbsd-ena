@@ -291,6 +291,44 @@ struct ena_admin_get_feat_resp {
 #define ENA_ADMIN_MTU					14
 
 /*
+ * RSS feature ids (ena_admin_defs.h:80-92). All three SET_FEATURE(RSS_*)
+ * commands carry their bulk payload (hash key / per-proto field table /
+ * indirection table) in the admin control buffer (flags |=
+ * ENA_ADMIN_AQ_COMMON_DESC_CTRL_DATA_INDIRECT_MASK, control_buffer.address/
+ * length pointing at a DMA region); only the small command body is inline.
+ */
+#define ENA_ADMIN_RSS_HASH_FUNCTION			10
+#define ENA_ADMIN_RSS_INDIRECTION_TABLE_CONFIG		12
+#define ENA_ADMIN_RSS_HASH_INPUT			18
+
+#define ENA_ADMIN_TOEPLITZ				1	/* hash function */
+#define ENA_ADMIN_RSS_KEY_PARTS				10	/* 40-byte key */
+#define ENA_RX_RSS_TABLE_LOG_SIZE			7
+#define ENA_RX_RSS_TABLE_SIZE	(1U << ENA_RX_RSS_TABLE_LOG_SIZE)	/* 128 */
+
+/* ena_admin_flow_hash_proto indices into the per-proto field table. */
+#define ENA_ADMIN_RSS_TCP4				0
+#define ENA_ADMIN_RSS_UDP4				1
+#define ENA_ADMIN_RSS_TCP6				2
+#define ENA_ADMIN_RSS_UDP6				3
+#define ENA_ADMIN_RSS_IP4				4
+#define ENA_ADMIN_RSS_IP6				5
+#define ENA_ADMIN_RSS_IP4_FRAG				6
+#define ENA_ADMIN_RSS_NOT_IP				7
+#define ENA_ADMIN_RSS_PROTO_NUM				16
+
+/* ena_admin_flow_hash_fields: which header fields feed the hash per proto. */
+#define ENA_ADMIN_RSS_L2_DA				0x01
+#define ENA_ADMIN_RSS_L2_SA				0x02
+#define ENA_ADMIN_RSS_L3_DA				0x04
+#define ENA_ADMIN_RSS_L3_SA				0x08
+#define ENA_ADMIN_RSS_L4_DP				0x10
+#define ENA_ADMIN_RSS_L4_SP				0x20
+/* input-sort bits for SET_FEATURE(RSS_HASH_INPUT) enabled_input_sort. */
+#define ENA_ADMIN_RSS_L3_SORT				0x02	/* BIT(1) */
+#define ENA_ADMIN_RSS_L4_SORT				0x04	/* BIT(2) */
+
+/*
  * Stateless offload capability feature (ena_admin_defs.h:64). GET_FEATURE on
  * this id returns ena_admin_feature_offload_desc; the driver caches which RX/TX
  * checksum offloads the device supports.
@@ -358,6 +396,56 @@ struct ena_admin_feature_aenq_desc {
 	uint32_t	enabled_groups;		/* groups to actually report */
 } __packed;
 
+/*
+ * RSS command bodies + control-buffer payloads (ena_admin_defs.h:876-1050).
+ * The *_desc/_function/_input/_table structs are SET_FEATURE command bodies
+ * (inline in the u union); the larger *_control structs and the entry array
+ * are written into the admin control-buffer DMA region. Multibyte fields LE.
+ */
+struct ena_admin_feature_rss_flow_hash_function {	/* body, 12B */
+	uint32_t	supported_func;
+	uint32_t	selected_func;	/* 1 << ENA_ADMIN_TOEPLITZ */
+	uint32_t	init_val;	/* 0: keep device default seed */
+} __packed;
+
+struct ena_admin_feature_rss_flow_hash_control {	/* ctrl buf, 48B */
+	uint32_t	key_parts;	/* = ENA_ADMIN_RSS_KEY_PARTS (10) */
+	uint32_t	reserved;
+	uint32_t	key[ENA_ADMIN_RSS_KEY_PARTS];	/* 40-byte hash key */
+} __packed;
+
+struct ena_admin_feature_rss_flow_hash_input {		/* body, 4B */
+	uint16_t	supported_input_sort;
+	uint16_t	enabled_input_sort;	/* L3_SORT | L4_SORT */
+} __packed;
+
+struct ena_admin_proto_input {				/* 4B */
+	uint16_t	fields;		/* ENA_ADMIN_RSS_L3_SA | ... */
+	uint16_t	reserved2;
+} __packed;
+
+struct ena_admin_feature_rss_hash_control {		/* ctrl buf, 256B */
+	struct ena_admin_proto_input	supported_fields[ENA_ADMIN_RSS_PROTO_NUM];
+	struct ena_admin_proto_input	selected_fields[ENA_ADMIN_RSS_PROTO_NUM];
+	struct ena_admin_proto_input	reserved2[ENA_ADMIN_RSS_PROTO_NUM];
+	struct ena_admin_proto_input	reserved3[ENA_ADMIN_RSS_PROTO_NUM];
+} __packed;
+
+struct ena_admin_rss_ind_table_entry {			/* ctrl buf entry, 4B */
+	uint16_t	cq_idx;		/* device-returned RX CQ index */
+	uint16_t	reserved;
+} __packed;
+
+struct ena_admin_feature_rss_ind_table {		/* body, 16B */
+	uint16_t	min_size;
+	uint16_t	max_size;
+	uint16_t	size;		/* log2 table size (ENA_RX_RSS_TABLE_LOG_SIZE) */
+	uint8_t		flags;
+	uint8_t		reserved;
+	uint32_t	inline_index;	/* 0xFFFFFFFF = whole table in ctrl buf */
+	struct ena_admin_rss_ind_table_entry	inline_entry;
+} __packed;
+
 /* ena_admin_defs.h:1281 — SET_FEATURE command (64-byte SQ payload). */
 struct ena_admin_set_feat_cmd {
 	struct ena_admin_aq_common_desc			aq_common_descriptor;
@@ -368,6 +456,9 @@ struct ena_admin_set_feat_cmd {
 		struct ena_admin_feature_aenq_desc	aenq;
 		struct ena_admin_set_feature_host_attr_desc host_attr;
 		struct ena_admin_set_feature_mtu_desc	mtu;
+		struct ena_admin_feature_rss_flow_hash_function	flow_hash_func;
+		struct ena_admin_feature_rss_flow_hash_input	flow_hash_input;
+		struct ena_admin_feature_rss_ind_table	ind_table;
 	} u;
 } __packed;
 

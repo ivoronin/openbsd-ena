@@ -27,6 +27,7 @@
 
 #include <net/if.h>
 #include <net/if_media.h>
+#include <net/toeplitz.h>	/* stoeplitz_to_key (RSS hash key) */
 
 #if NBPFILTER > 0
 #include <net/bpf.h>
@@ -35,6 +36,8 @@
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
 #include <netinet/ip.h>
+
+#include <sys/intrmap.h>
 
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
@@ -63,7 +66,7 @@ int	ena_aenq_init(struct ena_softc *);
 void	ena_aenq_intr(struct ena_softc *);
 
 int	ena_intr_mgmt(void *);
-int	ena_intr_io(void *);
+int	ena_intr_io_queue(void *);
 
 /* ifnet/ifmedia (Task 5) */
 int	ena_ioctl(struct ifnet *, u_long, caddr_t);
@@ -80,21 +83,21 @@ int	ena_restore_device(struct ena_softc *, int);
 
 /* IO RX path (Task 6) */
 void	ena_cq_unmask(struct ena_softc *, bus_size_t);
-int	ena_rx_create(struct ena_softc *);
-void	ena_rx_destroy(struct ena_softc *);
-void	ena_rx_fill(struct ena_softc *);
-int	ena_rxeof(struct ena_softc *);
-int	ena_rx_intr(struct ena_softc *);
+int	ena_rx_create(struct ena_softc *, unsigned int);
+void	ena_rx_destroy(struct ena_softc *, unsigned int);
+void	ena_rx_fill(struct ena_rxq *);
+int	ena_rxeof(struct ena_rxq *);
+int	ena_rx_intr(struct ena_rxq *);
 void	ena_rx_refill(void *);
 
 /* IO TX path (Task 7) */
 int	ena_tx_llq_map(struct ena_softc *, struct pci_attach_args *);
 int	ena_tx_llq_setup(struct ena_softc *);
 int	ena_tx_llq_negotiate(struct ena_softc *, struct pci_attach_args *);
-int	ena_tx_create(struct ena_softc *);
-void	ena_tx_destroy(struct ena_softc *);
-int	ena_encap(struct ena_softc *, struct mbuf *);
-int	ena_txeof(struct ena_softc *);
+int	ena_tx_create(struct ena_softc *, unsigned int);
+void	ena_tx_destroy(struct ena_softc *, unsigned int);
+int	ena_encap(struct ena_txq *, struct mbuf *);
+int	ena_txeof(struct ena_txq *);
 
 /*
  * The ring-slot sizes pinned in if_enavar.h (Task 5) must equal the real
@@ -264,8 +267,9 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	struct ena_softc *sc = (struct ena_softc *)self;
 	struct pci_attach_args *pa = aux;
 	pci_intr_handle_t ih;
-	const char *intrstr_mgmt, *intrstr_io;
+	const char *intrstr_mgmt, *intrstr_io = NULL;
 	pcireg_t memtype;
+	unsigned int i, nmsix;
 
 	sc->sc_pc = pa->pa_pc;
 	sc->sc_tag = pa->pa_tag;
@@ -410,21 +414,64 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 		goto free_mmio_resp;
 	}
 
-	/* IO vector (vector 1: RX + TX completion). */
-	if (pci_intr_map_msix(pa, 1, &ih) != 0) {
-		printf(": couldn't map IO interrupt (need 2 MSI-X vectors)\n");
+	/*
+	 * IO vectors (vector 1..N: one MSI-X per RX/TX queue pair). The MSI-X
+	 * table size bounds how many the device offers; reserve vector 0 for
+	 * mgmt and let intrmap distribute the rest across CPUs, clamped to
+	 * ENA_MAX_IO_QUEUES and the usable CPU count. On a 1-vCPU instance this
+	 * resolves to a single queue, behaviourally identical to the
+	 * pre-multiqueue driver.
+	 */
+	nmsix = pci_intr_msix_count(pa);
+	if (nmsix < 2) {
+		printf(": need at least 2 MSI-X vectors\n");
 		goto disestablish_mgmt;
 	}
-	intrstr_io = pci_intr_string(sc->sc_pc, ih);
-	sc->sc_io_ih = pci_intr_establish(sc->sc_pc, ih,
-	    IPL_NET | IPL_MPSAFE, ena_intr_io, sc, sc->sc_dev.dv_xname);
-	if (sc->sc_io_ih == NULL) {
-		printf(": couldn't establish IO interrupt\n");
+	nmsix--;	/* vector 0 is the management vector */
+	sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix,
+	    MIN(ENA_MAX_IO_QUEUES, IF_MAX_VECTORS), INTRMAP_POWEROF2);
+	if (sc->sc_intrmap == NULL) {
+		printf(": couldn't create intrmap\n");
 		goto disestablish_mgmt;
+	}
+	sc->sc_nqueues = intrmap_count(sc->sc_intrmap);
+
+	sc->sc_rxq = mallocarray(sc->sc_nqueues, sizeof(struct ena_rxq),
+	    M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->sc_txq = mallocarray(sc->sc_nqueues, sizeof(struct ena_txq),
+	    M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->sc_queues = mallocarray(sc->sc_nqueues, sizeof(struct ena_queue),
+	    M_DEVBUF, M_WAITOK | M_ZERO);
+
+	for (i = 0; i < sc->sc_nqueues; i++) {
+		struct ena_queue *q = &sc->sc_queues[i];
+
+		q->sc = sc;
+		q->idx = i;
+		snprintf(q->name, sizeof(q->name), "%s:%u",
+		    sc->sc_dev.dv_xname, i);
+		sc->sc_rxq[i].rxq_sc = sc;
+		sc->sc_rxq[i].rxq_id = i;
+		sc->sc_txq[i].txq_sc = sc;
+		sc->sc_txq[i].txq_id = i;
+
+		if (pci_intr_map_msix(pa, i + 1, &ih) != 0) {
+			printf(": couldn't map IO interrupt %u\n", i);
+			goto disestablish_io;
+		}
+		if (i == 0)
+			intrstr_io = pci_intr_string(sc->sc_pc, ih);
+		q->tag = pci_intr_establish_cpu(sc->sc_pc, ih,
+		    IPL_NET | IPL_MPSAFE, intrmap_cpu(sc->sc_intrmap, i),
+		    ena_intr_io_queue, q, q->name);
+		if (q->tag == NULL) {
+			printf(": couldn't establish IO interrupt %u\n", i);
+			goto disestablish_io;
+		}
 	}
 
-	sc->sc_nvec = 2;
-	printf(": mgmt %s io %s", intrstr_mgmt, intrstr_io);
+	sc->sc_nvec = 1 + sc->sc_nqueues;
+	printf(": mgmt %s io %s x%u", intrstr_mgmt, intrstr_io, sc->sc_nqueues);
 
 	/*
 	 * Device bring-up: reset the device, then program the admin queue.
@@ -572,6 +619,24 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 
 		if_attach(ifp);
 		ether_ifattach(ifp);
+
+		/*
+		 * Attach one stack send queue + one input queue per IO queue and
+		 * bind each to its txq/rxq, so ena_start runs per-ifqueue (recovering
+		 * its txq from ifq_softc) and ena_rxeof delivers per-ifiq. On a
+		 * 1-vCPU instance sc_nqueues is 1 -- a single ifq/ifiq, as before.
+		 */
+		if_attach_queues(ifp, sc->sc_nqueues);
+		if_attach_iqueues(ifp, sc->sc_nqueues);
+		for (i = 0; i < sc->sc_nqueues; i++) {
+			struct ifqueue *ifq = ifp->if_ifqs[i];
+			struct ifiqueue *ifiq = ifp->if_iqs[i];
+
+			ifq->ifq_softc = &sc->sc_txq[i];
+			sc->sc_txq[i].txq_ifq = ifq;
+			ifiq->ifiq_softc = &sc->sc_rxq[i];
+			sc->sc_rxq[i].rxq_ifiq = ifiq;
+		}
 	}
 
 	return;
@@ -581,8 +646,15 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	 * (IO before management) before freeing DMA memory.
 	 */
 disestablish_io:
-	pci_intr_disestablish(sc->sc_pc, sc->sc_io_ih);
-	sc->sc_io_ih = NULL;
+	for (i = 0; i < sc->sc_nqueues; i++) {
+		if (sc->sc_queues[i].tag != NULL)
+			pci_intr_disestablish(sc->sc_pc, sc->sc_queues[i].tag);
+	}
+	free(sc->sc_queues, M_DEVBUF,
+	    sc->sc_nqueues * sizeof(struct ena_queue));
+	free(sc->sc_rxq, M_DEVBUF, sc->sc_nqueues * sizeof(struct ena_rxq));
+	free(sc->sc_txq, M_DEVBUF, sc->sc_nqueues * sizeof(struct ena_txq));
+	intrmap_destroy(sc->sc_intrmap);
 disestablish_mgmt:
 	pci_intr_disestablish(sc->sc_pc, sc->sc_mgmt_ih);
 	sc->sc_mgmt_ih = NULL;
@@ -1062,6 +1134,9 @@ ena_get_dev_attr(struct ena_softc *sc)
 	 */
 	sc->sc_max_mtu = (max_mtu < ETHERMTU) ? ETHERMTU : max_mtu;
 
+	/* Feature bitmap: which SET_FEATUREs the device honours (gates RSS). */
+	sc->sc_supported_features = letoh32(attr->supported_features);
+
 	/*
 	 * Stash the MAC into sc_ac.ac_enaddr for use by ena_attach (Task 5).
 	 * ether_ifattach reads ac_enaddr to fill the ifnet's link-layer address,
@@ -1231,6 +1306,183 @@ ena_set_mtu(struct ena_softc *sc, uint32_t mtu)
 		printf("%s: SET_FEATURE(MTU=%u) failed (%d)\n",
 		    sc->sc_dev.dv_xname, mtu, error);
 	return (error);
+}
+
+/*
+ * Configure receive-side scaling so the device hashes incoming flows across
+ * the IO queues (each pinned to its own CPU in ena_attach). Three SET_FEATURE
+ * commands, each carrying its bulk payload in the admin control buffer:
+ *   - RSS_HASH_FUNCTION: select Toeplitz + the system stoeplitz key
+ *   - RSS_HASH_INPUT:    hash on L3 src/dst + L4 src/dst ports
+ *   - RSS_INDIRECTION_TABLE: 128 buckets round-robin'd over the queues, each
+ *     entry the DEVICE RX CQ index (rxq_cq_idx from CREATE_CQ), NOT the host
+ *     queue number.
+ * The control-buffer flag (bit 2 of aq flags) survives ena_admin_poll, which
+ * only stamps the phase bit. Any failure is non-fatal: leave sc_rss_active=0
+ * and run with all RX on queue 0. Called from ena_init after the queues exist.
+ */
+int
+ena_rss_config(struct ena_softc *sc)
+{
+	struct ena_admin_aq_entry cmd;
+	struct ena_admin_set_feat_cmd *sf =
+	    (struct ena_admin_set_feat_cmd *)&cmd;
+	struct ena_admin_feature_rss_flow_hash_control *key;
+	struct ena_admin_feature_rss_hash_control *hctrl;
+	struct ena_admin_rss_ind_table_entry *ind;
+	const bus_size_t indlen =
+	    ENA_RX_RSS_TABLE_SIZE * sizeof(struct ena_admin_rss_ind_table_entry);
+	uint64_t pa;
+	unsigned int i;
+	int n = 0, total = 0;
+
+	/* Lazily allocate the three control-buffer DMA regions (held for life). */
+	if (sc->sc_rss_key_dma.edm_map == NULL &&
+	    ena_dmamem_alloc(sc, &sc->sc_rss_key_dma, sizeof(*key), 8) != 0)
+		return (0);
+	if (sc->sc_rss_hashctrl_dma.edm_map == NULL &&
+	    ena_dmamem_alloc(sc, &sc->sc_rss_hashctrl_dma, sizeof(*hctrl), 8) != 0)
+		return (0);
+	if (sc->sc_rss_indtbl_dma.edm_map == NULL &&
+	    ena_dmamem_alloc(sc, &sc->sc_rss_indtbl_dma, indlen, 8) != 0)
+		return (0);
+
+	/*
+	 * Program only the RSS features the device lets the host set (its
+	 * supported_features bitmap, read in ena_get_dev_attr). Many ENA VFs
+	 * manage the hash function/input themselves -- a SET there returns
+	 * UNSUPPORTED_OPCODE -- yet still spread RX with their own default hash;
+	 * skip those and push only what is allowed (typically the indirection
+	 * table). RX-to-CPU spread works either way.
+	 */
+
+	/* 1. Toeplitz hash function + the system RSS key (control buffer). */
+	if (sc->sc_supported_features & (1U << ENA_ADMIN_RSS_HASH_FUNCTION)) {
+		total++;
+		key = (struct ena_admin_feature_rss_flow_hash_control *)
+		    ENA_DMA_KVA(&sc->sc_rss_key_dma);
+		memset(key, 0, sizeof(*key));
+		key->key_parts = htole32(ENA_ADMIN_RSS_KEY_PARTS);
+		stoeplitz_to_key(key->key, sizeof(key->key));
+		bus_dmamap_sync(sc->sc_dmat, ENA_DMA_MAP(&sc->sc_rss_key_dma), 0,
+		    sizeof(*key), BUS_DMASYNC_PREWRITE);
+
+		memset(&cmd, 0, sizeof(cmd));
+		sf->aq_common_descriptor.opcode = ENA_ADMIN_SET_FEATURE;
+		sf->aq_common_descriptor.flags =
+		    ENA_ADMIN_AQ_COMMON_DESC_CTRL_DATA_INDIRECT_MASK;
+		sf->feat_common.feature_id = ENA_ADMIN_RSS_HASH_FUNCTION;
+		sf->u.flow_hash_func.selected_func =
+		    htole32(1U << ENA_ADMIN_TOEPLITZ);
+		sf->control_buffer.length = htole32(sizeof(*key));
+		pa = ENA_DMA_DVA(&sc->sc_rss_key_dma);
+		sf->control_buffer.address.mem_addr_low = htole32((uint32_t)pa);
+		sf->control_buffer.address.mem_addr_high =
+		    htole16((uint16_t)(pa >> 32));
+		if (ena_admin_poll(sc, &cmd, NULL) == 0)
+			n++;
+		else
+			printf("%s: SET RSS hash function failed\n",
+			    sc->sc_dev.dv_xname);
+	}
+
+	/* 2. Hash input: L3 src/dst + L4 src/dst for TCP/UDP v4/v6 (control buf). */
+	if (sc->sc_supported_features & (1U << ENA_ADMIN_RSS_HASH_INPUT)) {
+		total++;
+		hctrl = (struct ena_admin_feature_rss_hash_control *)
+		    ENA_DMA_KVA(&sc->sc_rss_hashctrl_dma);
+		memset(hctrl, 0, sizeof(*hctrl));
+		for (i = 0; i < ENA_ADMIN_RSS_PROTO_NUM; i++) {
+			uint16_t f = 0;
+
+			switch (i) {
+			case ENA_ADMIN_RSS_TCP4:
+			case ENA_ADMIN_RSS_UDP4:
+			case ENA_ADMIN_RSS_TCP6:
+			case ENA_ADMIN_RSS_UDP6:
+				f = ENA_ADMIN_RSS_L3_SA | ENA_ADMIN_RSS_L3_DA |
+				    ENA_ADMIN_RSS_L4_SP | ENA_ADMIN_RSS_L4_DP;
+				break;
+			case ENA_ADMIN_RSS_IP4:
+			case ENA_ADMIN_RSS_IP6:
+			case ENA_ADMIN_RSS_IP4_FRAG:
+				f = ENA_ADMIN_RSS_L3_SA | ENA_ADMIN_RSS_L3_DA;
+				break;
+			}
+			hctrl->selected_fields[i].fields = htole16(f);
+		}
+		bus_dmamap_sync(sc->sc_dmat,
+		    ENA_DMA_MAP(&sc->sc_rss_hashctrl_dma), 0, sizeof(*hctrl),
+		    BUS_DMASYNC_PREWRITE);
+
+		memset(&cmd, 0, sizeof(cmd));
+		sf->aq_common_descriptor.opcode = ENA_ADMIN_SET_FEATURE;
+		sf->aq_common_descriptor.flags =
+		    ENA_ADMIN_AQ_COMMON_DESC_CTRL_DATA_INDIRECT_MASK;
+		sf->feat_common.feature_id = ENA_ADMIN_RSS_HASH_INPUT;
+		sf->u.flow_hash_input.enabled_input_sort =
+		    htole16(ENA_ADMIN_RSS_L3_SORT | ENA_ADMIN_RSS_L4_SORT);
+		sf->control_buffer.length = htole32(sizeof(*hctrl));
+		pa = ENA_DMA_DVA(&sc->sc_rss_hashctrl_dma);
+		sf->control_buffer.address.mem_addr_low = htole32((uint32_t)pa);
+		sf->control_buffer.address.mem_addr_high =
+		    htole16((uint16_t)(pa >> 32));
+		if (ena_admin_poll(sc, &cmd, NULL) == 0)
+			n++;
+		else
+			printf("%s: SET RSS hash input failed\n",
+			    sc->sc_dev.dv_xname);
+	}
+
+	/*
+	 * 3. Indirection table: 128 buckets round-robin'd across the queues.
+	 * Despite the field name, ena-com programs each entry's cq_idx with the
+	 * RX SQ index (ena_com.c:1389 rss_ind_tbl[i].cq_idx = io_sq->idx, where
+	 * io_sq->idx is the CREATE_SQ-returned sq_idx) -- NOT the CQ index. Using
+	 * rxq_cq_idx steers ~half the buckets to the wrong queue on devices where
+	 * the SQ and CQ indices differ.
+	 */
+	if (sc->sc_supported_features &
+	    (1U << ENA_ADMIN_RSS_INDIRECTION_TABLE_CONFIG)) {
+		total++;
+		ind = (struct ena_admin_rss_ind_table_entry *)
+		    ENA_DMA_KVA(&sc->sc_rss_indtbl_dma);
+		for (i = 0; i < ENA_RX_RSS_TABLE_SIZE; i++) {
+			ind[i].cq_idx =
+			    htole16(sc->sc_rxq[i % sc->sc_nqueues].rxq_sq_idx);
+			ind[i].reserved = 0;
+		}
+		bus_dmamap_sync(sc->sc_dmat,
+		    ENA_DMA_MAP(&sc->sc_rss_indtbl_dma), 0, indlen,
+		    BUS_DMASYNC_PREWRITE);
+
+		memset(&cmd, 0, sizeof(cmd));
+		sf->aq_common_descriptor.opcode = ENA_ADMIN_SET_FEATURE;
+		sf->aq_common_descriptor.flags =
+		    ENA_ADMIN_AQ_COMMON_DESC_CTRL_DATA_INDIRECT_MASK;
+		sf->feat_common.feature_id =
+		    ENA_ADMIN_RSS_INDIRECTION_TABLE_CONFIG;
+		sf->u.ind_table.size = htole16(ENA_RX_RSS_TABLE_LOG_SIZE);
+		sf->u.ind_table.inline_index = htole32(0xffffffff);
+		sf->control_buffer.length = htole32((uint32_t)indlen);
+		pa = ENA_DMA_DVA(&sc->sc_rss_indtbl_dma);
+		sf->control_buffer.address.mem_addr_low = htole32((uint32_t)pa);
+		sf->control_buffer.address.mem_addr_high =
+		    htole16((uint16_t)(pa >> 32));
+		if (ena_admin_poll(sc, &cmd, NULL) == 0)
+			n++;
+		else
+			printf("%s: SET RSS indirection table failed\n",
+			    sc->sc_dev.dv_xname);
+	}
+
+	if (total == 0)
+		printf("%s: RSS managed by device (no host-settable features)\n",
+		    sc->sc_dev.dv_xname);
+	else
+		printf("%s: RSS programmed %d/%d features across %u queues\n",
+		    sc->sc_dev.dv_xname, n, total, sc->sc_nqueues);
+	return (0);
 }
 
 int
@@ -1513,20 +1765,23 @@ ena_intr_mgmt(void *xsc)
  * Returns 1 (interrupt claimed) to satisfy the interrupt framework.
  */
 int
-ena_intr_io(void *xsc)
+ena_intr_io_queue(void *arg)
 {
-	struct ena_softc *sc = xsc;
+	struct ena_queue *q = arg;
+	struct ena_softc *sc = q->sc;
+	struct ena_txq *txq = &sc->sc_txq[q->idx];
+	struct ena_rxq *rxq = &sc->sc_rxq[q->idx];
 
 	/*
-	 * The IO MSI-X vector services both the RX and TX completion queues.
-	 * Drain TX completions first (reclaim mbufs / free SQ space) so a
-	 * subsequent ena_start has room, then service RX. Each helper guards on
-	 * its own "created" flag, so a spurious interrupt before bring-up (or
-	 * after teardown) touches no freed memory.
+	 * This IO MSI-X vector services exactly one RX/TX queue pair. Drain TX
+	 * completions first (reclaim mbufs / free SQ space) so a subsequent
+	 * ena_start has room, then service RX. Each helper guards on its own
+	 * "created" flag, so a spurious interrupt before bring-up (or after
+	 * teardown) touches no freed memory.
 	 */
-	if (sc->sc_tx_created)
-		ena_txeof(sc);
-	ena_rx_intr(sc);
+	if (txq->txq_created)
+		ena_txeof(txq);
+	ena_rx_intr(rxq);
 	return (1);
 }
 
@@ -1535,6 +1790,7 @@ ena_detach(struct device *self, int flags)
 {
 	struct ena_softc *sc = (struct ena_softc *)self;
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	unsigned int i;
 
 	/* Nothing mapped: attach failed before the BAR was mapped. */
 	if (sc->sc_mems == 0)
@@ -1609,10 +1865,18 @@ ena_detach(struct device *self, int flags)
 	 * Disestablish in reverse establish order: IO vector first, then
 	 * management. Guards on NULL so partial-attach detach is safe.
 	 */
-	if (sc->sc_io_ih != NULL) {
-		pci_intr_disestablish(sc->sc_pc, sc->sc_io_ih);
-		sc->sc_io_ih = NULL;
+	for (i = 0; i < sc->sc_nqueues; i++) {
+		if (sc->sc_queues[i].tag != NULL) {
+			pci_intr_disestablish(sc->sc_pc, sc->sc_queues[i].tag);
+			sc->sc_queues[i].tag = NULL;
+		}
 	}
+	free(sc->sc_queues, M_DEVBUF,
+	    sc->sc_nqueues * sizeof(struct ena_queue));
+	free(sc->sc_rxq, M_DEVBUF, sc->sc_nqueues * sizeof(struct ena_rxq));
+	free(sc->sc_txq, M_DEVBUF, sc->sc_nqueues * sizeof(struct ena_txq));
+	if (sc->sc_intrmap != NULL)
+		intrmap_destroy(sc->sc_intrmap);
 	if (sc->sc_mgmt_ih != NULL) {
 		pci_intr_disestablish(sc->sc_pc, sc->sc_mgmt_ih);
 		sc->sc_mgmt_ih = NULL;
@@ -1634,6 +1898,12 @@ ena_detach(struct device *self, int flags)
 	ena_dmamem_free(sc, &sc->sc_mmio_resp_dma);
 	if (sc->sc_host_attr_dma.edm_map != NULL)
 		ena_dmamem_free(sc, &sc->sc_host_attr_dma);
+	if (sc->sc_rss_key_dma.edm_map != NULL)
+		ena_dmamem_free(sc, &sc->sc_rss_key_dma);
+	if (sc->sc_rss_hashctrl_dma.edm_map != NULL)
+		ena_dmamem_free(sc, &sc->sc_rss_hashctrl_dma);
+	if (sc->sc_rss_indtbl_dma.edm_map != NULL)
+		ena_dmamem_free(sc, &sc->sc_rss_indtbl_dma);
 	bus_dmamap_sync(sc->sc_dmat, ENA_DMA_MAP(&sc->sc_acq_dma), 0,
 	    ENA_DMA_LEN(&sc->sc_acq_dma),
 	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
@@ -1721,9 +1991,9 @@ ena_cq_unmask(struct ena_softc *sc, bus_size_t unmask_off)
  * a sync below (see the per-sync audit on each direction).
  */
 int
-ena_rx_create(struct ena_softc *sc)
+ena_rx_create(struct ena_softc *sc, unsigned int idx)
 {
-	struct ena_rxq *rxq = &sc->sc_rxq;
+	struct ena_rxq *rxq = &sc->sc_rxq[idx];
 	struct ena_admin_aq_entry cmd;
 	struct ena_admin_acq_entry resp;
 	struct ena_admin_aq_create_cq_cmd *cc =
@@ -1797,7 +2067,7 @@ ena_rx_create(struct ena_softc *sc)
 	cc->cq_caps_2 = (ENA_RX_CDESC_SIZE / 4) &
 	    ENA_ADMIN_AQ_CREATE_CQ_CMD_CQ_ENTRY_SIZE_WORDS_MASK;
 	cc->cq_caps_1 = ENA_ADMIN_AQ_CREATE_CQ_CMD_INTERRUPT_MODE_ENABLED_MASK;
-	cc->msix_vector = htole32(1);	/* ENA_IO_IRQ_FIRST_IDX (Task 3) */
+	cc->msix_vector = htole32(idx + 1);	/* per-queue IO vector (vec 0 = mgmt) */
 	cc->cq_depth = htole16(rxq->rxq_depth);
 	cc->cq_ba.mem_addr_low = htole32((uint32_t)cq_pa);
 	cc->cq_ba.mem_addr_high = htole16((uint16_t)(cq_pa >> 32));
@@ -1850,7 +2120,7 @@ ena_rx_create(struct ena_softc *sc)
 	 */
 	ena_cq_unmask(sc, rxq->rxq_unmask_off);
 
-	sc->sc_rx_created = 1;
+	rxq->rxq_created = 1;
 	return (0);
 
 destroy_cq:
@@ -1886,9 +2156,9 @@ free_sq:
  * maps and rings.
  */
 void
-ena_rx_destroy(struct ena_softc *sc)
+ena_rx_destroy(struct ena_softc *sc, unsigned int idx)
 {
-	struct ena_rxq *rxq = &sc->sc_rxq;
+	struct ena_rxq *rxq = &sc->sc_rxq[idx];
 	struct ena_admin_aq_entry cmd;
 	struct ena_admin_aq_destroy_sq_cmd *ds =
 	    (struct ena_admin_aq_destroy_sq_cmd *)&cmd;
@@ -1896,7 +2166,7 @@ ena_rx_destroy(struct ena_softc *sc)
 	    (struct ena_admin_aq_destroy_cq_cmd *)&cmd;
 	uint16_t i;
 
-	if (!sc->sc_rx_created)
+	if (!rxq->rxq_created)
 		return;
 
 	/* DESTROY_SQ (RX direction) first. */
@@ -1915,7 +2185,7 @@ ena_rx_destroy(struct ena_softc *sc)
 	if (ena_admin_poll(sc, &cmd, NULL) != 0)
 		printf("%s: DESTROY_CQ failed\n", sc->sc_dev.dv_xname);
 
-	sc->sc_rx_created = 0;
+	rxq->rxq_created = 0;
 
 	/*
 	 * The device has dropped both rings; reclaim the in-flight clusters.
@@ -1965,9 +2235,9 @@ ena_rx_destroy(struct ena_softc *sc)
  *     just stored so the device's read behind the doorbell sees them.
  */
 void
-ena_rx_fill(struct ena_softc *sc)
+ena_rx_fill(struct ena_rxq *rxq)
 {
-	struct ena_rxq *rxq = &sc->sc_rxq;
+	struct ena_softc *sc = rxq->rxq_sc;
 	struct ena_eth_io_rx_desc *ring, *desc;
 	struct ena_rx_slot *rxs;
 	struct mbuf *m;
@@ -2055,14 +2325,13 @@ ena_rx_fill(struct ena_softc *sc)
  * the ring is still empty. Mirrors mcx_refill (if_mcx.c:6805).
  */
 void
-ena_rx_refill(void *xsc)
+ena_rx_refill(void *arg)
 {
-	struct ena_softc *sc = xsc;
-	struct ena_rxq *rxq = &sc->sc_rxq;
+	struct ena_rxq *rxq = arg;
 	int s;
 
 	s = splnet();
-	ena_rx_fill(sc);
+	ena_rx_fill(rxq);
 	if (if_rxr_inuse(&rxq->rxq_rxr) == 0)
 		timeout_add(&rxq->rxq_refill, 1);
 	splx(s);
@@ -2098,10 +2367,9 @@ ena_rx_refill(void *xsc)
  * Returns the number of packets enqueued.
  */
 int
-ena_rxeof(struct ena_softc *sc)
+ena_rxeof(struct ena_rxq *rxq)
 {
-	struct ena_rxq *rxq = &sc->sc_rxq;
-	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	struct ena_softc *sc = rxq->rxq_sc;
 	struct ena_eth_io_rx_cdesc_base *ring, *cdesc;
 	struct ena_rx_slot *rxs;
 	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
@@ -2167,6 +2435,16 @@ ena_rxeof(struct ena_softc *sc)
 		m->m_pkthdr.len = m->m_len = len;
 
 		/*
+		 * With RSS active, hand the stack the device's flow hash so it can
+		 * pick a matching TX queue for return traffic. RX-to-CPU spread is
+		 * already done by the per-vector ISR this completion arrived on.
+		 */
+		if (sc->sc_rss_active) {
+			m->m_pkthdr.ph_flowid = letoh32(cdesc->hash);
+			SET(m->m_pkthdr.csum_flags, M_FLOWID);
+		}
+
+		/*
 		 * RX checksum-offload decode (never-drop policy): set only the
 		 * *_IN_OK flags when the device reports a verified-good checksum.
 		 * We never set *_IN_BAD -- a device misreport simply degrades to
@@ -2214,8 +2492,9 @@ ena_rxeof(struct ena_softc *sc)
 
 	if (rxfree > 0) {
 		if_rxr_put(&rxq->rxq_rxr, rxfree);
-		if_input(ifp, &ml);
-		ena_rx_fill(sc);
+		if (ifiq_input(rxq->rxq_ifiq, &ml))
+			if_rxr_livelocked(&rxq->rxq_rxr);
+		ena_rx_fill(rxq);
 		if (if_rxr_inuse(&rxq->rxq_rxr) == 0)
 			timeout_add(&rxq->rxq_refill, 1);
 	}
@@ -2233,17 +2512,17 @@ ena_rxeof(struct ena_softc *sc)
 }
 
 /*
- * RX interrupt entry, called from ena_intr_io. The IO CQ was created in
- * interrupt mode; service it. Guard on sc_rx_created so a spurious interrupt
+ * RX interrupt entry, called from ena_intr_io_queue. The IO CQ was created in
+ * interrupt mode; service it. Guard on rxq_created so a spurious interrupt
  * before the queue is up (or after teardown) touches no freed memory.
  */
 int
-ena_rx_intr(struct ena_softc *sc)
+ena_rx_intr(struct ena_rxq *rxq)
 {
-	if (!sc->sc_rx_created)
+	if (!rxq->rxq_created)
 		return (0);
 
-	return (ena_rxeof(sc));
+	return (ena_rxeof(rxq));
 }
 
 /*
@@ -2501,9 +2780,9 @@ ena_tx_llq_negotiate(struct ena_softc *sc, struct pci_attach_args *pa)
  * stash it and write entries at txq_llq_off + index*entry_size.
  */
 int
-ena_tx_create(struct ena_softc *sc)
+ena_tx_create(struct ena_softc *sc, unsigned int idx)
 {
-	struct ena_txq *txq = &sc->sc_txq;
+	struct ena_txq *txq = &sc->sc_txq[idx];
 	struct ena_admin_aq_entry cmd;
 	struct ena_admin_acq_entry resp;
 	struct ena_admin_aq_create_cq_cmd *cc =
@@ -2606,7 +2885,7 @@ ena_tx_create(struct ena_softc *sc)
 	cc->cq_caps_2 = (ENA_TX_CDESC_SIZE / 4) &
 	    ENA_ADMIN_AQ_CREATE_CQ_CMD_CQ_ENTRY_SIZE_WORDS_MASK;
 	cc->cq_caps_1 = ENA_ADMIN_AQ_CREATE_CQ_CMD_INTERRUPT_MODE_ENABLED_MASK;
-	cc->msix_vector = htole32(1);	/* ENA_IO_IRQ_FIRST_IDX (Task 3) */
+	cc->msix_vector = htole32(idx + 1);	/* per-queue IO vector (vec 0 = mgmt) */
 	cc->cq_depth = htole16(txq->txq_depth);
 	cc->cq_ba.mem_addr_low = htole32((uint32_t)cq_pa);
 	cc->cq_ba.mem_addr_high = htole16((uint16_t)(cq_pa >> 32));
@@ -2680,7 +2959,7 @@ ena_tx_create(struct ena_softc *sc)
 	 */
 	ena_cq_unmask(sc, txq->txq_unmask_off);
 
-	sc->sc_tx_created = 1;
+	txq->txq_created = 1;
 	return (0);
 
 destroy_sq:
@@ -2729,9 +3008,9 @@ free_cq:
  * destroyed; only then do we reclaim in-flight mbufs and free the rings/maps.
  */
 void
-ena_tx_destroy(struct ena_softc *sc)
+ena_tx_destroy(struct ena_softc *sc, unsigned int idx)
 {
-	struct ena_txq *txq = &sc->sc_txq;
+	struct ena_txq *txq = &sc->sc_txq[idx];
 	struct ena_admin_aq_entry cmd;
 	struct ena_admin_aq_destroy_sq_cmd *ds =
 	    (struct ena_admin_aq_destroy_sq_cmd *)&cmd;
@@ -2739,7 +3018,7 @@ ena_tx_destroy(struct ena_softc *sc)
 	    (struct ena_admin_aq_destroy_cq_cmd *)&cmd;
 	uint16_t i;
 
-	if (!sc->sc_tx_created)
+	if (!txq->txq_created)
 		return;
 
 	/* DESTROY_SQ (TX direction) first. */
@@ -2758,7 +3037,7 @@ ena_tx_destroy(struct ena_softc *sc)
 	if (ena_admin_poll(sc, &cmd, NULL) != 0)
 		printf("%s: TX DESTROY_CQ failed\n", sc->sc_dev.dv_xname);
 
-	sc->sc_tx_created = 0;
+	txq->txq_created = 0;
 
 	/*
 	 * Reclaim any mbufs still in flight. The device has dropped the queues,
@@ -2836,9 +3115,9 @@ ena_tx_destroy(struct ena_softc *sc)
  * --------------------------------------------------------------------------
  */
 int
-ena_encap(struct ena_softc *sc, struct mbuf *m)
+ena_encap(struct ena_txq *txq, struct mbuf *m)
 {
-	struct ena_txq *txq = &sc->sc_txq;
+	struct ena_softc *sc = txq->txq_sc;
 	struct ena_tx_slot *txs;
 	struct ena_eth_io_tx_desc *desc;
 	bus_dmamap_t map;
@@ -3349,10 +3628,9 @@ ena_encap(struct ena_softc *sc, struct mbuf *m)
  * Returns the number of packets reclaimed.
  */
 int
-ena_txeof(struct ena_softc *sc)
+ena_txeof(struct ena_txq *txq)
 {
-	struct ena_txq *txq = &sc->sc_txq;
-	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	struct ena_softc *sc = txq->txq_sc;
 	struct ena_eth_io_tx_cdesc *ring, *cdesc;
 	struct ena_tx_slot *txs;
 	uint16_t qmask, idx, req_id;
@@ -3426,13 +3704,13 @@ ena_txeof(struct ena_softc *sc)
 	bus_dmamap_sync(sc->sc_dmat, ENA_DMA_MAP(&txq->txq_cq_dma), 0,
 	    ENA_DMA_LEN(&txq->txq_cq_dma), BUS_DMASYNC_PREREAD);
 
-	if (txfree > 0 && ifq_is_oactive(&ifp->if_snd)) {
-		ifq_clr_oactive(&ifp->if_snd);
-		ifq_restart(&ifp->if_snd);
+	if (txfree > 0 && ifq_is_oactive(txq->txq_ifq)) {
+		ifq_clr_oactive(txq->txq_ifq);
+		ifq_restart(txq->txq_ifq);
 	}
 
 	/*
-	 * Do NOT re-arm the shared IO MSI-X vector here. ena_intr_io drains TX
+	 * Do NOT re-arm the per-queue IO MSI-X vector here. ena_intr_io_queue drains TX
 	 * (this function) then RX (ena_rx_intr -> ena_rxeof), and ena_rxeof issues
 	 * a single unmask at the very end of the handler -- mirroring FreeBSD
 	 * ena_cleanup. Re-arming mid-handler here too (a second unmask of the same
@@ -3454,13 +3732,11 @@ int
 ena_init(struct ena_softc *sc)
 {
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
-	struct ena_rxq *rxq = &sc->sc_rxq;
+	unsigned int i;
 	int error;
 
 	if (ISSET(ifp->if_flags, IFF_RUNNING))
 		return (0);
-
-	timeout_set(&rxq->rxq_refill, ena_rx_refill, sc);
 
 	/*
 	 * Derive the RX cluster size from the active MTU and program the device
@@ -3480,47 +3756,56 @@ ena_init(struct ena_softc *sc)
 	if (error != 0)
 		return (error);
 
-	error = ena_rx_create(sc);
-	if (error != 0)
-		return (error);
-
 	/*
-	 * Seed the RX ring accounting and post the initial buffers. if_rxr_init
-	 * caps the live buffer count; ena_rx_fill posts as many as the ring
-	 * allows. A low-water mark of 2 mirrors the common OpenBSD NIC idiom.
+	 * Create each IO queue pair (CREATE_CQ then CREATE_SQ for RX, then TX)
+	 * and seed each RX ring. On a 1-vCPU instance sc_nqueues is 1, identical
+	 * to the pre-multiqueue path.
 	 *
-	 * Cap the high-water mark at depth-1, never depth: ena-com never posts
-	 * the last SQ slot (ena_com_free_q_entries returns q_depth - 1 - used),
-	 * because posting all depth descriptors makes tail - next_to_comp ==
-	 * depth, which masks to 0 and the device reads the ring as empty. Capping
-	 * the if_rxr budget at depth-1 keeps at most depth-1 descriptors posted.
+	 * if_rxr_init caps the live RX buffer count (low-water 2, the common
+	 * OpenBSD idiom); ena_rx_fill posts as many as the ring allows. Cap the
+	 * high-water at depth-1, never depth: ena-com never posts the last SQ
+	 * slot, so depth descriptors would mask tail-next_to_comp to 0 and the
+	 * device would read the ring as empty. Bound jumbo RX memory by clamping
+	 * the budget to 256 when the buffer exceeds MCLBYTES (~9.5KB clusters at
+	 * MTU 9000 would otherwise pin ~9.5MB per queue).
 	 */
-	{
-		u_int hi = rxq->rxq_depth - 1;
+	for (i = 0; i < sc->sc_nqueues; i++) {
+		struct ena_rxq *rxq = &sc->sc_rxq[i];
+		u_int hi;
 
-		/*
-		 * Bound RX cluster memory for jumbo: at MTU 9000 each buffer is a
-		 * ~9.5KB pool cluster, so a full depth-1 ring would pin ~9.5MB on a
-		 * 467MB box. Cap the live-buffer budget (not the DMA ring geometry)
-		 * to 256 when jumbo (~2.4MB, comparable to the 1500 footprint); the
-		 * default MTU keeps the full depth-1 budget.
-		 */
+		timeout_set(&rxq->rxq_refill, ena_rx_refill, rxq);
+
+		error = ena_rx_create(sc, i);
+		if (error != 0)
+			goto down;
+
+		hi = rxq->rxq_depth - 1;
 		if (sc->sc_rx_buf_size > MCLBYTES && hi > 256)
 			hi = 256;
 		if_rxr_init(&rxq->rxq_rxr, 2, hi);
+		ena_rx_fill(rxq);
+
+		error = ena_tx_create(sc, i);
+		if (error != 0)
+			goto down;
 	}
-	ena_rx_fill(sc);
 
 	/*
-	 * Create the IO TX queue (CREATE_CQ then CREATE_SQ). On failure, tear
-	 * down the RX queue we just created so a retried ena_init starts clean.
+	 * With more than one queue, program RSS so the device spreads RX across
+	 * them (the indirection table uses the rxq_cq_idx values just filled by
+	 * CREATE_CQ). Single-queue needs no hashing. Non-fatal on failure.
 	 */
-	error = ena_tx_create(sc);
-	if (error != 0) {
-		timeout_del(&rxq->rxq_refill);
-		ena_rx_destroy(sc);
-		return (error);
-	}
+	if (sc->sc_nqueues > 1) {
+		/*
+		 * Multi-queue: the device hashes RX across the queues (its own
+		 * default hash, or the explicit table ena_rss_config programs), so
+		 * cdesc->hash is meaningful -- enable the RX flowid. Then best-effort
+		 * program whatever RSS features the device lets the host set.
+		 */
+		sc->sc_rss_active = 1;
+		(void)ena_rss_config(sc);
+	} else
+		sc->sc_rss_active = 0;
 
 	SET(ifp->if_flags, IFF_RUNNING);
 	ifq_clr_oactive(&ifp->if_snd);
@@ -3544,6 +3829,15 @@ ena_init(struct ena_softc *sc)
 		timeout_add_sec(&sc->sc_wd_tick, ENA_WATCHDOG_HZ);
 
 	return (0);
+
+down:
+	/* Tear down whatever was created so a retried ena_init starts clean. */
+	for (i = 0; i < sc->sc_nqueues; i++) {
+		timeout_del(&sc->sc_rxq[i].rxq_refill);
+		ena_tx_destroy(sc, i);
+		ena_rx_destroy(sc, i);
+	}
+	return (error);
 }
 
 /*
@@ -3558,11 +3852,23 @@ void
 ena_stop(struct ena_softc *sc)
 {
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
-	struct ena_rxq *rxq = &sc->sc_rxq;
+	unsigned int i;
 
 	CLR(ifp->if_flags, IFF_RUNNING);
-	ifq_clr_oactive(&ifp->if_snd);
-	ifq_barrier(&ifp->if_snd);
+	sc->sc_rss_active = 0;
+
+	/*
+	 * Quiesce each per-queue send ring (clear oactive + barrier) and barrier
+	 * its IO interrupt, so no ena_start or ena_intr_io_queue is mid-flight
+	 * against a queue about to be torn down. Mirrors igc_stop. On a 1-vCPU
+	 * instance sc_nqueues is 1 and if_ifqs[0] is if_snd.
+	 */
+	for (i = 0; i < sc->sc_nqueues; i++) {
+		ifq_clr_oactive(ifp->if_ifqs[i]);
+		ifq_barrier(ifp->if_ifqs[i]);
+		if (sc->sc_queues[i].tag != NULL)
+			intr_barrier(sc->sc_queues[i].tag);
+	}
 
 	/*
 	 * Cancel the watchdog callout so it stops sampling while the interface
@@ -3571,10 +3877,12 @@ ena_stop(struct ena_softc *sc)
 	 * it never touches the rings being torn down below, so it is safe to let
 	 * a final in-flight tick complete.
 	 */
-	timeout_del(&rxq->rxq_refill);
 	timeout_del(&sc->sc_wd_tick);
-	ena_tx_destroy(sc);
-	ena_rx_destroy(sc);
+	for (i = 0; i < sc->sc_nqueues; i++) {
+		timeout_del(&sc->sc_rxq[i].rxq_refill);
+		ena_tx_destroy(sc, i);
+		ena_rx_destroy(sc, i);
+	}
 }
 
 /*
@@ -3852,8 +4160,7 @@ void
 ena_start(struct ifqueue *ifq)
 {
 	struct ifnet *ifp = ifq->ifq_if;
-	struct ena_softc *sc = ifp->if_softc;
-	struct ena_txq *txq = &sc->sc_txq;
+	struct ena_txq *txq = ifq->ifq_softc;
 	struct mbuf *m;
 	uint16_t qmask;
 	int error;
@@ -3865,7 +4172,7 @@ ena_start(struct ifqueue *ifq)
 	 * while the link is down). Gating on link state here would race the
 	 * AENQ and could drop the first ARP (the Phase-1 checkpoint packet).
 	 */
-	if (!sc->sc_tx_created) {
+	if (!txq->txq_created) {
 		ifq_purge(ifq);
 		return;
 	}
@@ -3902,7 +4209,7 @@ ena_start(struct ifqueue *ifq)
 			bpf_mtap(ifp->if_bpf, m, BPF_DIRECTION_OUT);
 #endif
 
-		error = ena_encap(sc, m);
+		error = ena_encap(txq, m);
 		if (error == ENOBUFS) {
 			/*
 			 * Ring filled between the pre-check and encap (should not

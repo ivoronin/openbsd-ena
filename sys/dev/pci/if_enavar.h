@@ -211,7 +211,16 @@ struct ena_rx_slot {
  *   rxq_refill			timeout that retries fill when clusters are
  *				temporarily unavailable.
  */
+struct ena_softc;
+struct intrmap;
+struct ifqueue;
+struct ifiqueue;
+
 struct ena_rxq {
+	struct ena_softc	*rxq_sc;	/* backptr (refill callout / ISR) */
+	unsigned int		 rxq_id;	/* queue index [0, sc_nqueues) */
+	struct ifiqueue		*rxq_ifiq;	/* stack RX input queue (delivery) */
+	int			 rxq_created;	/* CREATE_CQ/SQ done (teardown gate) */
 	struct ena_dma		 rxq_sq_dma;	/* RX SQ ring (host->device) */
 	struct ena_dma		 rxq_cq_dma;	/* RX CQ ring (device->host) */
 	struct ena_rx_slot	*rxq_slots;	/* depth ena_rx_slot entries */
@@ -267,6 +276,10 @@ struct ena_tx_slot {
  *   txq_prod / txq_cons	host slot ring producer/consumer (free-slot count).
  */
 struct ena_txq {
+	struct ena_softc	*txq_sc;	/* backptr */
+	unsigned int		 txq_id;	/* queue index [0, sc_nqueues) */
+	struct ifqueue		*txq_ifq;	/* stack TX output queue */
+	int			 txq_created;	/* CREATE_CQ/SQ done (teardown gate) */
 	struct ena_dma		 txq_sq_dma;	/* host-mem TX SQ ring (fallback) */
 	struct ena_dma		 txq_cq_dma;	/* TX CQ ring (device->host) */
 	struct ena_tx_slot	*txq_slots;	/* depth ena_tx_slot entries */
@@ -288,6 +301,21 @@ struct ena_txq {
 	uint16_t		 txq_sq_avail;	/* free SQ descriptor slots
 					 * (host placement; LLQ unused) */
 };
+
+/*
+ * Per-IO-vector interrupt container (one per IO queue pair). Mirrors struct
+ * igc_queue: the ISR arg carries the softc + queue index so it services
+ * exactly its RX+TX pair; tag is the pci_intr_establish_cpu handle.
+ */
+struct ena_queue {
+	struct ena_softc	*sc;
+	unsigned int		 idx;		/* queue index (msix_vector - 1) */
+	void			*tag;		/* pci_intr handle */
+	char			 name[24];	/* "enaN:M" interrupt string */
+};
+
+/* Hard cap on IO queue pairs (clamped by device max, ncpu, msix table size). */
+#define ENA_MAX_IO_QUEUES	8
 
 struct ena_softc {
 	struct device		 sc_dev;
@@ -344,6 +372,7 @@ struct ena_softc {
 	uint8_t			 sc_rx_csum_l4;	/* dev supports RX L4 IPv4 csum */
 	uint32_t		 sc_max_mtu;	/* device max L2-payload MTU (GET dev_attr) */
 	uint32_t		 sc_rx_buf_size; /* per-desc RX cluster size, derived from if_mtu */
+	uint32_t		 sc_supported_features; /* GET dev_attr feature bitmap (gates RSS SETs) */
 
 	/* DMA tag for admin/IO queue allocations (Tasks 5-8) */
 	bus_dma_tag_t		 sc_dmat;
@@ -361,6 +390,10 @@ struct ena_softc {
 	struct ena_dma		 sc_acq_dma;	/* admin CQ ring */
 	struct ena_dma		 sc_mmio_resp_dma; /* readless MMIO resp region */
 	struct ena_dma		 sc_host_attr_dma; /* 4KB host-info page (HOST_ATTR) */
+	struct ena_dma		 sc_rss_key_dma;     /* 48B RSS Toeplitz key (ctrl buf) */
+	struct ena_dma		 sc_rss_hashctrl_dma; /* 256B RSS per-proto fields (ctrl buf) */
+	struct ena_dma		 sc_rss_indtbl_dma;  /* 512B RSS indirection table (ctrl buf) */
+	int			 sc_rss_active;	/* RSS configured (multi-queue RX spread) */
 	uint16_t		 sc_admin_depth;
 	uint8_t			 sc_aq_phase;	/* SQ producer phase bit */
 	uint8_t			 sc_acq_phase;	/* CQ consumer phase bit */
@@ -382,9 +415,12 @@ struct ena_softc {
 	 * CREATE_CQ admin command's msix_vector field (ena_com.c:1470); that
 	 * wiring is Tasks 6/7.  No separate SET_FEATURE(MSIX) call exists.
 	 */
-	int			 sc_nvec;	/* vectors established */
-	void			*sc_mgmt_ih;	/* management vector handle */
-	void			*sc_io_ih;	/* IO vector handle */
+	int			 sc_nvec;	/* vectors established (1 + sc_nqueues) */
+	void			*sc_mgmt_ih;	/* management vector handle (vector 0) */
+	struct intrmap		*sc_intrmap;	/* IO vector -> CPU distribution */
+	unsigned int		 sc_nqueues;	/* number of IO queue pairs */
+	struct ena_queue	*sc_queues;	/* sc_nqueues IO interrupt containers */
+	unsigned int		 sc_max_io_queues; /* device max IO queue pairs */
 
 	/*
 	 * Asynchronous Event Notification Queue (Task 4). sc_aenq_dma holds the
@@ -430,8 +466,7 @@ struct ena_softc {
 	 * (DESTROY_SQ then DESTROY_CQ). sc_rx_created gates the teardown so a
 	 * stop on a never-started interface is a no-op.
 	 */
-	struct ena_rxq		 sc_rxq;	/* RX queue state */
-	int			 sc_rx_created;	/* RX queue is live */
+	struct ena_rxq		*sc_rxq;	/* sc_nqueues RX queues (mallocarray) */
 
 	/*
 	 * IO TX queue (Task 7). Phase 1 runs a single TX queue. Created in
@@ -439,8 +474,7 @@ struct ena_softc {
 	 * (DESTROY_SQ then DESTROY_CQ). sc_tx_created gates the teardown so a
 	 * stop on a never-started interface is a no-op.
 	 */
-	struct ena_txq		 sc_txq;	/* TX queue state */
-	int			 sc_tx_created;	/* TX queue is live */
+	struct ena_txq		*sc_txq;	/* sc_nqueues TX queues (mallocarray) */
 };
 
 int	ena_dmamem_alloc(struct ena_softc *, struct ena_dma *, bus_size_t,
@@ -498,11 +532,12 @@ int	ena_admin_poll(struct ena_softc *, struct ena_admin_aq_entry *,
 	    struct ena_admin_acq_entry *);
 int	ena_get_dev_attr(struct ena_softc *);
 int	ena_set_mtu(struct ena_softc *, uint32_t);
+int	ena_rss_config(struct ena_softc *);
 int	ena_aenq_init(struct ena_softc *);
 void	ena_aenq_intr(struct ena_softc *);
 
 int	ena_intr_mgmt(void *);
-int	ena_intr_io(void *);
+int	ena_intr_io_queue(void *);
 
 /* ifnet/ifmedia routines (Task 5) */
 int	ena_ioctl(struct ifnet *, u_long, caddr_t);
@@ -523,17 +558,17 @@ int	ena_restore_device(struct ena_softc *, int);
 
 /* IO RX path (Task 6) */
 void	ena_cq_unmask(struct ena_softc *, bus_size_t);
-void	ena_rx_fill(struct ena_softc *);
-int	ena_rxeof(struct ena_softc *);
-int	ena_rx_intr(struct ena_softc *);
+void	ena_rx_fill(struct ena_rxq *);
+int	ena_rxeof(struct ena_rxq *);
+int	ena_rx_intr(struct ena_rxq *);
 
 /* IO TX path (Task 7) */
 int	ena_tx_llq_map(struct ena_softc *, struct pci_attach_args *);
 int	ena_tx_llq_setup(struct ena_softc *);
 int	ena_tx_llq_negotiate(struct ena_softc *, struct pci_attach_args *);
-int	ena_tx_create(struct ena_softc *);
-void	ena_tx_destroy(struct ena_softc *);
-int	ena_encap(struct ena_softc *, struct mbuf *);
-int	ena_txeof(struct ena_softc *);
+int	ena_tx_create(struct ena_softc *, unsigned int);
+void	ena_tx_destroy(struct ena_softc *, unsigned int);
+int	ena_encap(struct ena_txq *, struct mbuf *);
+int	ena_txeof(struct ena_txq *);
 
 #endif /* _DEV_PCI_IF_ENAVAR_H_ */

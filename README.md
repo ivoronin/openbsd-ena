@@ -51,8 +51,14 @@ implements the full Phase-1 bring-up and data path:
 - **AENQ** (Asynchronous Event Notification Queue) — the device's back-channel
   for link-state changes and ~1 Hz keep-alive heartbeats, drained from the
   management MSI-X interrupt.
-- **IO queues** — a single RX queue and a single TX queue (`CREATE_CQ` /
-  `CREATE_SQ`), with `bus_dma(9)`-mapped descriptor rings and mbuf buffers.
+- **IO queues** — one RX/TX queue pair per usable CPU (`CREATE_CQ` /
+  `CREATE_SQ`), each on its own MSI-X vector with `bus_dma(9)`-mapped
+  descriptor rings and mbuf buffers; the queue count follows the CPU count
+  via `intrmap(9)`.
+- **RSS** — receive-side scaling spreads RX across the queues by the device's
+  Toeplitz hash. The indirection table is programmed where the VF permits it
+  (many VFs manage the hash internally and still spread RX); `ph_flowid` keeps
+  each flow's TX on the same queue as its RX.
 - **TX** — both the LLQ "push-mode" path (header written directly into a device
   BAR window, negotiated when the device advertises it) and the host-memory
   fallback used on VFs that don't offer LLQ.
@@ -166,14 +172,23 @@ the first is true today.
   NIC: it gets its DHCP lease, comes up multiuser, runs `sshd`, and accepts
   **SSH logins over `ena0`** — the milestone that retires the QEMU-shim build server
 - IPv4 TX/RX checksum offload, gated on the device's reported feature
+- **multi-queue with RSS** — one RX/TX pair per CPU; on a 2-vCPU instance RX
+  genuinely spreads across both CPUs (both per-queue MSI-X vectors carry
+  balanced interrupt load under `iperf3 -P 8`, ~3.2 Gbit/s)
+- **MTU / jumbo frames** to 9000, plus multi-stream throughput and soak runs
+  with no device-fatal events
 - compiles under `-Werror`; the data path is the normal `ifnet`/`ifq` path
 
 **What does not work yet / is unverified:**
-- **Robustness is thin.** A working SSH session is not throughput, multi-queue,
-  MTU/jumbo, link flaps, or days of uptime — none of that is characterized yet.
-- **TX uses host-memory placement on this VF.** The Graviton `t4g` VF exposes no
-  LLQ memory BAR, so TX descriptors go through a host-memory SQ (per-descriptor
-  submission); the LLQ push path is implemented but unexercised on this hardware.
+- **Long-haul robustness is still thin.** Throughput, multi-queue/RSS, and
+  MTU/jumbo are now characterized, but link flaps and days-of-uptime stability
+  are not.
+- **LLQ-capable instances don't bring `ena0` up yet.** `t4g` VFs use host-memory
+  TX placement (per-descriptor SQ submission), which is validated. Larger
+  instances (`c7g` and friends) expose the LLQ push BAR — but on those the RX
+  `CREATE_CQ` is rejected during bring-up and `ena0` never attaches. The LLQ
+  push path itself was only ever exercised on a VFIO test harness; root-causing
+  the newer-VF RX-queue rejection is in progress.
 - **Device reset / recovery does not work yet.** A keep-alive / `DEV_STS`
   watchdog detects a wedged device and logs it, but automatic device-reset
   recovery is gated off: on native hardware a host-initiated device reset leaves
@@ -210,9 +225,13 @@ to the exact `ena-com`/FreeBSD line it was transcribed from, and
   offload; keep-alive/`DEV_STS` watchdog (detection). (Booting natively also needed
   a separate nvme(4) queue-size fix and an SPCR serial-console fix — both in
   `contrib/openbsd-patches/`, submittable to `tech@` on their own.)
-- **Phase 2 — make it real** — automatic device reset/recovery (under validation);
-  multi-queue; MTU/jumbo; throughput + stress/soak; cleanup and a submission to
-  OpenBSD `tech@`
+- **Phase 2 — scale-out** ✓ (mostly) — multi-queue + RSS (RX scales across CPUs,
+  one MSI-X vector per queue), MTU/jumbo to 9000, and multi-stream
+  throughput/soak, all validated on real Graviton2.
+- **Phase 3 — make it deployable** — `ena0` bring-up on LLQ-capable instances
+  (`c7g`/`m7g`; the RX `CREATE_CQ` rejection above); automatic device
+  reset/recovery (still unsolved); link-flap and long-uptime soak; cleanup and a
+  submission to OpenBSD `tech@`.
 
 ## Credits
 
