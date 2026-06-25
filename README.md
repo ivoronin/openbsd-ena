@@ -195,10 +195,12 @@ the first is true today.
   recovery is gated off: on native hardware a host-initiated device reset leaves
   the device in `DEV_STS` FATAL and the data path does not come back, so
   auto-reset would only storm. Restoring the data path after a reset is unsolved.
-- **Not reviewed, not upstreamed.** No OpenBSD developer has looked at it; it has
-  not been submitted to `tech@` and would need cleanup and review first. The
-  per-file license headers carry an empty `$OpenBSD$` tag as a placeholder, not a
-  claim of inclusion.
+- **Not upstreamed — and won't be.** This driver is openly AI-assisted, and
+  OpenBSD does not accept AI-generated code: lacking a human author it isn't
+  copyrightable, so it can't be folded into their tree without diluting the
+  licensing of the source aggregate. It stays an independent driver for running
+  native OpenBSD on Graviton, not an upstream candidate. The per-file `$OpenBSD$`
+  tags are empty placeholders, not a claim of inclusion.
 
 In short: the genuinely hard, genuinely doubted thing — does a from-scratch ENA
 implementation boot OpenBSD natively on Graviton and carry a real SSH session —
@@ -225,14 +227,17 @@ to the exact `ena-com`/FreeBSD line it was transcribed from, and
   a real `t4g` with `ena0` as its only NIC and **SSH-in works**; IPv4 checksum
   offload; keep-alive/`DEV_STS` watchdog (detection). (Booting natively also needed
   a separate nvme(4) queue-size fix and an SPCR serial-console fix — both in
-  `contrib/openbsd-patches/`, submittable to `tech@` on their own.)
+  `contrib/openbsd-patches/`. These are small, factual bug-fixes to existing
+  code that a human could re-derive and submit independently, but this project
+  itself isn't pursuing upstreaming.)
 - **Phase 2 — scale-out** ✓ (mostly) — multi-queue + RSS (RX scales across CPUs,
   one MSI-X vector per queue), MTU/jumbo to 9000, and multi-stream
   throughput/soak, all validated on real Graviton2.
 - **Phase 3 — make it deployable** — `ena0` bring-up on LLQ-capable instances
   (`c7g`/`m7g`; the RX `CREATE_CQ` rejection above); automatic device
-  reset/recovery (still unsolved); link-flap and long-uptime soak; cleanup and a
-  submission to OpenBSD `tech@`.
+  reset/recovery (still unsolved); building on the latest `-current` snapshot;
+  link-flap and long-uptime soak; general cleanup. (Not headed for `tech@` — see
+  "Not upstreamed" above for why.)
 
 ## Credits
 
