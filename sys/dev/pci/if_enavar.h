@@ -202,6 +202,9 @@ struct ena_rx_slot {
  *   rxq_cq_db			RX CQ head doorbell BAR offset (CREATE_CQ resp).
  *   rxq_unmask_off		RX CQ interrupt-unmask BAR offset (CREATE_CQ resp);
  *				written to re-arm the IO MSI-X after it fires.
+ *   rxq_ids			free RX req_id ring; consumed in ena_rx_fill at the
+ *				SQ tail (rxq_sq_tail & qmask), produced in ena_rxeof.
+ *   rxq_next_to_clean		next free-ring slot to return a completed req_id.
  *   rxq_sq_tail		monotonic SQ producer index; the value written
  *				to the SQ doorbell (ena-com io_sq->tail).
  *   rxq_sq_phase		producer phase bit stamped into each rx_desc.
@@ -230,6 +233,8 @@ struct ena_rxq {
 	bus_size_t		 rxq_sq_db;	/* SQ doorbell BAR offset */
 	bus_size_t		 rxq_cq_db;	/* CQ head doorbell BAR offset */
 	bus_size_t		 rxq_unmask_off; /* CQ intr unmask BAR offset */
+	uint16_t		*rxq_ids;	/* free req_id ring */
+	uint16_t		 rxq_next_to_clean;
 	uint16_t		 rxq_sq_tail;	/* SQ producer index (doorbell) */
 	uint8_t			 rxq_sq_phase;	/* SQ producer phase bit */
 	uint16_t		 rxq_cq_head;	/* CQ consumer index */
@@ -264,7 +269,6 @@ struct ena_tx_slot {
  *
  *   txq_sq_idx / txq_cq_idx	device-returned queue indices (CREATE_SQ/CQ).
  *   txq_sq_db			TX SQ doorbell BAR offset (CREATE_SQ resp).
- *   txq_unmask_off		TX CQ interrupt-unmask BAR offset (CREATE_CQ resp).
  *   txq_llq			1 if LLQ (push) placement, 0 if host-memory.
  *   txq_llq_off		llq_descriptors_offset within BAR2 (CREATE_SQ resp).
  *   txq_llq_t / txq_llq_h	bus_space tag/handle for the BAR2 LLQ window.
@@ -287,7 +291,6 @@ struct ena_txq {
 	uint16_t		 txq_sq_idx;	/* device SQ index */
 	uint16_t		 txq_cq_idx;	/* device CQ index */
 	bus_size_t		 txq_sq_db;	/* SQ doorbell BAR offset */
-	bus_size_t		 txq_unmask_off; /* CQ intr unmask BAR offset */
 	int			 txq_llq;	/* LLQ placement in use */
 	bus_size_t		 txq_llq_off;	/* LLQ desc offset in BAR2 */
 	bus_space_tag_t		 txq_llq_t;	/* BAR2 LLQ window tag */

@@ -53,6 +53,7 @@ int	ena_detach(struct device *, int);
 int	ena_dmamem_alloc(struct ena_softc *, struct ena_dma *, bus_size_t,
 	    bus_size_t);
 void	ena_dmamem_free(struct ena_softc *, struct ena_dma *);
+int	ena_msix_bar_assign(struct pci_attach_args *);
 
 int	ena_reset(struct ena_softc *);
 void	ena_mmio_resp_write(struct ena_softc *);
@@ -261,6 +262,38 @@ ena_dmamem_free(struct ena_softc *sc, struct ena_dma *m)
 	bus_dmamap_destroy(sc->sc_dmat, m->edm_map);
 }
 
+int
+ena_msix_bar_assign(struct pci_attach_args *pa)
+{
+	pci_chipset_tag_t pc = pa->pa_pc;
+	pcitag_t tag = pa->pa_tag;
+	bus_addr_t base;
+	bus_size_t size;
+	pcireg_t cap, table, type;
+	int off, bir, bar;
+
+	/*
+	 * Mirror the gate in the kernel's _pci_intr_map_msix: if MSI/MSI-X is
+	 * administratively disabled, MSI-X will not be used, so do not touch the
+	 * MSI-X table BAR. Without this, the pci_mapreg_assign below would program
+	 * the BAR and flip MEM/MASTER-enable on a path that never establishes
+	 * MSI-X. (amd64 also gates on mp_busses != NULL, but that is not visible
+	 * from MI code; PCI_FLAGS_MSI_ENABLED tracks it in practice.)
+	 */
+	if ((pa->pa_flags & PCI_FLAGS_MSI_ENABLED) == 0)
+		return (ENXIO);
+
+	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, &off, &cap) == 0)
+		return (ENXIO);
+
+	table = pci_conf_read(pc, tag, off + PCI_MSIX_TABLE);
+	bir = table & PCI_MSIX_TABLE_BIR;
+	bar = PCI_MAPREG_START + bir * 4;
+	type = pci_mapreg_type(pc, tag, bar);
+
+	return (pci_mapreg_assign(pa, bar, type, &base, &size));
+}
+
 void
 ena_attach(struct device *parent, struct device *self, void *aux)
 {
@@ -270,6 +303,7 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	const char *intrstr_mgmt, *intrstr_io = NULL;
 	pcireg_t memtype;
 	unsigned int i, nmsix;
+	int error;
 
 	sc->sc_pc = pa->pa_pc;
 	sc->sc_tag = pa->pa_tag;
@@ -397,6 +431,12 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	 * Mirrors if_mcx.c:2895-2908 (admin vector) and :3014-3023
 	 * (per-queue vectors).
 	 */
+
+	error = ena_msix_bar_assign(pa);
+	if (error != 0) {
+		printf(": can't assign MSI-X table BAR (%d)\n", error);
+		goto free_mmio_resp;
+	}
 
 	/* Management vector (vector 0: admin + AENQ). */
 	if (pci_intr_map_msix(pa, 0, &ih) != 0) {
@@ -1848,6 +1888,14 @@ ena_intr_io_queue(void *arg)
 	 * ena_start has room, then service RX. Each helper guards on its own
 	 * "created" flag, so a spurious interrupt before bring-up (or after
 	 * teardown) touches no freed memory.
+	 *
+	 * Re-arm is the single ena_cq_unmask at the end of ena_rxeof: the mask
+	 * is per-vector, so that one unmask re-arms the whole shared vector and
+	 * both TX and RX completions resume. Do NOT add a second unmask of the
+	 * TX CQ here -- it re-arms the same vector twice, and re-arming the TX
+	 * CQ mid-handler (in ena_txeof, before RX is drained) previously raced
+	 * the device mask and stalled the datapath after ~20 packets. FreeBSD
+	 * ena_cleanup likewise issues one re-arm per interrupt.
 	 */
 	if (txq->txq_created)
 		ena_txeof(txq);
@@ -2004,7 +2052,9 @@ ena_detach(struct device *self, int flags)
  * intr_reg with INTR_UNMASK set to the per-CQ unmask BAR offset the device
  * returned in the CREATE_CQ response (cq_interrupt_unmask_register_offset).
  * This is NOT the global ENA_REGS_INTR_MASK_OFF register (that is the admin/
- * management mask); each IO CQ has its own unmask register.
+ * management mask); each IO CQ has its own unmask register, but the RX and TX
+ * CQ of a queue pair share one MSI-X vector, so writing either re-arms the
+ * whole vector and a single re-arm per interrupt suffices.
  *
  * Phase 1 uses no interrupt moderation, so the RX/TX delay fields are zero and
  * intr_control is just the UNMASK bit. Mirrors ena_com_update_intr_reg
@@ -2083,6 +2133,7 @@ ena_rx_create(struct ena_softc *sc, unsigned int idx)
 	rxq->rxq_sq_phase = 1;	/* first SQ descriptor is written phase 1 */
 	rxq->rxq_cq_head = 0;
 	rxq->rxq_cq_phase = 1;	/* first CQ completion is read at phase 1 */
+	rxq->rxq_next_to_clean = 0;
 
 	/* Allocate the RX SQ (host->device) and RX CQ (device->host) rings. */
 	if (ena_dmamem_alloc(sc, &rxq->rxq_sq_dma,
@@ -2099,6 +2150,8 @@ ena_rx_create(struct ena_softc *sc, unsigned int idx)
 	/* Per-slot bookkeeping + DMA maps for the data clusters. */
 	rxq->rxq_slots = mallocarray(rxq->rxq_depth,
 	    sizeof(struct ena_rx_slot), M_DEVBUF, M_WAITOK | M_ZERO);
+	rxq->rxq_ids = mallocarray(rxq->rxq_depth, sizeof(*rxq->rxq_ids),
+	    M_DEVBUF, M_WAITOK);
 	/*
 	 * Size each slot's DMA map for the current MTU's buffer. A map's maxsize
 	 * is fixed at create time, so it must cover the largest cluster ena_rx_fill
@@ -2107,6 +2160,7 @@ ena_rx_create(struct ena_softc *sc, unsigned int idx)
 	 * maps on every down, so a down/up bounce recreates them at the new size.
 	 */
 	for (i = 0; i < rxq->rxq_depth; i++) {
+		rxq->rxq_ids[i] = i;
 		if (bus_dmamap_create(sc->sc_dmat, sc->sc_rx_buf_size, 1,
 		    sc->sc_rx_buf_size, 0, BUS_DMA_WAITOK | BUS_DMA_64BIT,
 		    &rxq->rxq_slots[i].rxs_map) != 0) {
@@ -2184,9 +2238,11 @@ ena_rx_create(struct ena_softc *sc, unsigned int idx)
 
 	/*
 	 * Arm the IO CQ interrupt once after create. The device masks the IO
-	 * MSI-X after each fire; without this initial unmask the very first RX
-	 * interrupt never arrives. Mirrors ena_unmask_interrupt in ena_up
-	 * (ena_netdev.c) which unmasks each IO CQ after the queues are created.
+	 * MSI-X after each fire; without this initial unmask the very first IO
+	 * interrupt never arrives. The mask is per-vector and the RX/TX CQ of
+	 * this queue pair share one vector, so this single arm enables the whole
+	 * vector -- the TX CQ created next reuses it and needs no separate arm.
+	 * FreeBSD arms one CQ per queue pair at bring-up for the same reason.
 	 */
 	ena_cq_unmask(sc, rxq->rxq_unmask_off);
 
@@ -2212,6 +2268,8 @@ free_maps:
 	free(rxq->rxq_slots, M_DEVBUF,
 	    rxq->rxq_depth * sizeof(struct ena_rx_slot));
 	rxq->rxq_slots = NULL;
+	free(rxq->rxq_ids, M_DEVBUF, rxq->rxq_depth * sizeof(*rxq->rxq_ids));
+	rxq->rxq_ids = NULL;
 	ena_dmamem_free(sc, &rxq->rxq_cq_dma);
 free_sq:
 	ena_dmamem_free(sc, &rxq->rxq_sq_dma);
@@ -2277,6 +2335,8 @@ ena_rx_destroy(struct ena_softc *sc, unsigned int idx)
 	free(rxq->rxq_slots, M_DEVBUF,
 	    rxq->rxq_depth * sizeof(struct ena_rx_slot));
 	rxq->rxq_slots = NULL;
+	free(rxq->rxq_ids, M_DEVBUF, rxq->rxq_depth * sizeof(*rxq->rxq_ids));
+	rxq->rxq_ids = NULL;
 
 	ena_dmamem_free(sc, &rxq->rxq_cq_dma);
 	ena_dmamem_free(sc, &rxq->rxq_sq_dma);
@@ -2289,12 +2349,13 @@ ena_rx_destroy(struct ena_softc *sc, unsigned int idx)
  * (ena_eth_com.c:646). The if_rxr ring caps how many buffers we keep posted;
  * if_rxr_get returns how many we may add this round.
  *
- * For each slot: allocate a cluster, bus_dmamap_load_mbuf, write the rx_desc
- * (length, req_id = slot index, FIRST|LAST|COMP_REQ|phase, buffer phys addr in
- * little-endian), and PREREAD-sync the data buffer (the device DMA-writes the
- * received frame into it). After the batch: PREWRITE-sync the SQ ring (the
- * device reads the descriptors we just wrote) and ring the SQ doorbell with the
- * monotonic SQ tail (ena_com_write_rx_sq_doorbell writes io_sq->tail,
+ * For each buffer: take the next free req_id, allocate a cluster,
+ * bus_dmamap_load_mbuf, write the rx_desc at the SQ tail (length, req_id,
+ * FIRST|LAST|COMP_REQ|phase, buffer phys addr in little-endian), and
+ * PREREAD-sync the data buffer (the device DMA-writes the received frame into
+ * it). After the batch: PREWRITE-sync the SQ ring (the device reads the
+ * descriptors we just wrote) and ring the SQ doorbell with the monotonic SQ
+ * tail (ena_com_write_rx_sq_doorbell writes io_sq->tail,
  * ena_eth_com.h:174-182).
  *
  * Per-sync audit:
@@ -2312,7 +2373,7 @@ ena_rx_fill(struct ena_rxq *rxq)
 	struct ena_rx_slot *rxs;
 	struct mbuf *m;
 	uint64_t paddr;
-	uint16_t qmask, slot;
+	uint16_t qmask, idx, slot;
 	u_int slots, filled;
 
 	qmask = rxq->rxq_depth - 1;
@@ -2323,9 +2384,15 @@ ena_rx_fill(struct ena_rxq *rxq)
 		return;
 
 	for (filled = 0; filled < slots; filled++) {
-		slot = rxq->rxq_sq_tail & qmask;
+		idx = rxq->rxq_sq_tail & qmask;
+		/*
+		 * The free-id ring is consumed in lockstep with the SQ producer --
+		 * one req_id taken per posted descriptor -- so the SQ tail doubles
+		 * as the consumer cursor: take the next free req_id at idx.
+		 */
+		slot = rxq->rxq_ids[idx];
 		rxs = &rxq->rxq_slots[slot];
-		desc = &ring[slot];
+		desc = &ring[idx];
 
 		m = MCLGETL(NULL, M_DONTWAIT, sc->sc_rx_buf_size);
 		if (m == NULL)
@@ -2417,10 +2484,11 @@ ena_rx_refill(void *arg)
  *
  * Walk: for each cdesc whose PHASE bit matches the host consumer phase, read
  * length + req_id (little-endian); recover the slot via req_id; POSTREAD-sync
- * and unload its data buffer; set the mbuf length and enqueue it; advance the
- * CQ head and flip phase on wrap. Bounded by the ring depth (at most depth
- * completions can be host-owned at once). After the walk, hand the list to the
- * stack, account the freed buffers to if_rxr, and refill.
+ * and unload its data buffer; return req_id to the free-ID ring; set the mbuf
+ * length and enqueue it; advance the CQ head and flip phase on wrap. Bounded by
+ * the ring depth (at most depth completions can be host-owned at once). After
+ * the walk, hand the list to the stack, account the freed buffers to if_rxr,
+ * and refill.
  *
  * Per-sync audit:
  *   RX CQ POSTREAD (before the phase-bit walk): the device DMA-wrote the
@@ -2478,7 +2546,15 @@ ena_rxeof(struct ena_rxq *rxq)
 		if ((rxq->rxq_cq_head & qmask) == 0)
 			phase ^= 1;
 
-		/* Guard a malformed req_id rather than index out of bounds. */
+		/*
+		 * Guard a malformed req_id rather than index out of bounds. The
+		 * completion stream is out of sync with the ring (device protocol
+		 * violation); the proper recovery is a device reset, but that path
+		 * is deliberately gated off for now (ena_tick), so this currently
+		 * just leaks the slot and its if_rxr credit -- the id is out of
+		 * range and cannot go back on the free ring. Re-wire the reset (RX
+		 * and TX both) once the watchdog reset path is enabled.
+		 */
 		if (req_id >= rxq->rxq_depth) {
 			printf("%s: RX bad req_id %u\n", sc->sc_dev.dv_xname,
 			    req_id);
@@ -2502,6 +2578,8 @@ ena_rxeof(struct ena_rxq *rxq)
 
 		m = rxs->rxs_m;
 		rxs->rxs_m = NULL;
+		rxq->rxq_ids[rxq->rxq_next_to_clean & qmask] = req_id;
+		rxq->rxq_next_to_clean++;
 		m->m_pkthdr.len = m->m_len = len;
 
 		/*
@@ -2967,7 +3045,6 @@ ena_tx_create(struct ena_softc *sc, unsigned int idx)
 		goto free_maps;
 	}
 	txq->txq_cq_idx = letoh16(cr->cq_idx);
-	txq->txq_unmask_off = letoh32(cr->cq_interrupt_unmask_register_offset);
 
 	/* --- CREATE_SQ (TX direction), bound to the CQ just created. --- */
 	placement = txq->txq_llq ? ENA_ADMIN_PLACEMENT_POLICY_DEV :
@@ -3022,13 +3099,12 @@ ena_tx_create(struct ena_softc *sc, unsigned int idx)
 	}
 
 	/*
-	 * Arm the TX CQ interrupt once after create. The device masks the IO
-	 * MSI-X after each fire; without this initial unmask the first TX
-	 * completion interrupt never arrives. The TX CQ has its OWN unmask
-	 * register (txq_unmask_off), distinct from the RX CQ's.
+	 * No separate interrupt arm here. The TX and RX CQ of this queue pair
+	 * share one MSI-X vector and the mask is per-vector, so the single arm
+	 * issued at the end of ena_rx_create (rxq_unmask_off) already enabled
+	 * this vector; ena_rxeof keeps it re-armed on every interrupt. FreeBSD
+	 * likewise arms one CQ per queue pair, never the TX CQ separately.
 	 */
-	ena_cq_unmask(sc, txq->txq_unmask_off);
-
 	txq->txq_created = 1;
 	return (0);
 
@@ -3779,15 +3855,6 @@ ena_txeof(struct ena_txq *txq)
 		ifq_restart(txq->txq_ifq);
 	}
 
-	/*
-	 * Do NOT re-arm the per-queue IO MSI-X vector here. ena_intr_io_queue drains TX
-	 * (this function) then RX (ena_rx_intr -> ena_rxeof), and ena_rxeof issues
-	 * a single unmask at the very end of the handler -- mirroring FreeBSD
-	 * ena_cleanup. Re-arming mid-handler here too (a second unmask of the same
-	 * shared vector) raced the device's per-vector mask and could leave the
-	 * vector silent after the first burst (data path dies after ~20 packets).
-	 */
-
 	return (txfree);
 }
 
@@ -3853,6 +3920,16 @@ ena_init(struct ena_softc *sc)
 		if (sc->sc_rx_buf_size > MCLBYTES && hi > 256)
 			hi = 256;
 		if_rxr_init(&rxq->rxq_rxr, 2, hi);
+		/*
+		 * if_rxr_init starts the current watermark at the low-water mark
+		 * (2) and only grows it by one per tick (if_rxr_adjust_cwm), so a
+		 * cold ring would ramp from 2 to hi over ~hi ticks (~10s at HZ 100)
+		 * with RX throttled the whole time. Force the first fill to post a
+		 * full ring instead. if_rxr has no public cwm setter, so this reaches
+		 * into the ring directly; it only seeds the initial value -- the
+		 * adaptive shrink under livelock (if_rxr_livelocked) still applies.
+		 */
+		rxq->rxq_rxr.rxr_cwm = hi;
 		ena_rx_fill(rxq);
 
 		error = ena_tx_create(sc, i);
